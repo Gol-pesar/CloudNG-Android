@@ -23,6 +23,7 @@ import com.example.R
 import com.example.model.AppSettings
 import com.example.model.LogLevel
 import com.example.model.PerAppProxyMode
+import com.example.model.RamThreadGuide
 import com.example.model.VpnConfig
 import com.example.model.VpnStatus
 import com.example.protocol.ParsedCleanIp
@@ -93,7 +94,7 @@ class WorkerVpnService : VpnService() {
   private var underlyingCallback: ConnectivityManager.NetworkCallback? = null
   @Volatile private var underlyingNetwork: Network? = null
   @Volatile private var tunnelActive: Boolean = false
-  private val outboundQueue = ArrayBlockingQueue<ByteArray>(16384)
+  private val outboundQueue = ArrayBlockingQueue<ByteArray>(32768)
 
   override fun onCreate() {
     super.onCreate()
@@ -192,6 +193,8 @@ class WorkerVpnService : VpnService() {
       tunInterface = pfd
 
       val protectedFactory = createProtectedSocketFactory()
+      val workerThreads =
+        settings.workerThreads.coerceIn(RamThreadGuide.MIN_THREADS, RamThreadGuide.MAX_THREADS)
       val underlyingDnsLookup: (String) -> List<InetAddress> = { host ->
         val net = underlyingNetwork
         val resolved =
@@ -206,21 +209,24 @@ class WorkerVpnService : VpnService() {
           cleanIp = cleanIp,
           socketFactory = protectedFactory,
           connectTimeoutSec = 6L,
+          workerThreads = workerThreads,
           fallbackDnsLookup = underlyingDnsLookup,
-        ).newBuilder()
-          .connectionPool(ConnectionPool(32, 120, TimeUnit.SECONDS))
-          .build()
+        )
       sharedWorkerClient = workerClient
 
-      // Pre-warm TLS 1.3 session ticket & Cloudflare Worker isolate over underlying network
-      scope.launch(Dispatchers.IO) {
-        prewarmWorkerTls(workerClient, parsedUrl, cleanIp)
+      // Pre-warm TLS 1.3 session tickets & multiple concurrent Worker isolates in parallel
+      val prewarmCount = workerThreads.coerceIn(2, 10)
+      for (idx in 0 until prewarmCount) {
+        scope.launch(Dispatchers.IO) {
+          prewarmWorkerTls(workerClient, parsedUrl, cleanIp, logResult = idx == 0)
+        }
       }
 
       val enqueueToTun: (ByteArray) -> Unit = { pkt ->
-        if (!outboundQueue.offer(pkt)) {
-          outboundQueue.poll()
-          outboundQueue.offer(pkt)
+        if (tunnelActive) {
+          if (!outboundQueue.offer(pkt)) {
+            runCatching { outboundQueue.offer(pkt, 200L, TimeUnit.MILLISECONDS) }
+          }
         }
       }
 
@@ -248,6 +254,7 @@ class WorkerVpnService : VpnService() {
           sharedWorkerClient = workerClient,
           dnsHandler = dns,
           vpnStateRepository = stateRepo,
+          workerThreads = workerThreads,
           writeToTun = enqueueToTun,
         )
       tcpManager = tcp
@@ -263,7 +270,7 @@ class WorkerVpnService : VpnService() {
       stateRepo.log(
         LogLevel.INFO,
         "VPN",
-        "TUN ready (MTU ${config.mtu}, self-bypass active, per-app=${settings.perAppMode.key})",
+        "TUN ready (MTU ${config.mtu}, ${workerThreads}T workers, self-bypass active, per-app=${settings.perAppMode.key})",
       )
 
       // High-priority TUN writer loop
@@ -422,6 +429,7 @@ class WorkerVpnService : VpnService() {
     client: OkHttpClient,
     parsedUrl: ParsedWorkerUrl,
     cleanIp: ParsedCleanIp?,
+    logResult: Boolean = false,
   ) {
     val start = System.currentTimeMillis()
     val effectivePort = cleanIp?.port ?: parsedUrl.port
@@ -434,12 +442,14 @@ class WorkerVpnService : VpnService() {
         .build()
     runCatching {
       client.newCall(req).execute().use { resp ->
-        val elapsed = System.currentTimeMillis() - start
-        stateRepo.log(
-          LogLevel.INFO,
-          "WARM",
-          "TLS & Worker isolate pre-warmed in ${elapsed}ms (HTTP ${resp.code})",
-        )
+        if (logResult) {
+          val elapsed = System.currentTimeMillis() - start
+          stateRepo.log(
+            LogLevel.INFO,
+            "WARM",
+            "TLS & Worker isolate pre-warmed in ${elapsed}ms (HTTP ${resp.code})",
+          )
+        }
       }
     }
   }

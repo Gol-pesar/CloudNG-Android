@@ -1,5 +1,6 @@
 package com.example.ui.viewmodel
 
+import android.app.ActivityManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -17,6 +18,7 @@ import com.example.model.InstalledAppInfo
 import com.example.model.LogEntry
 import com.example.model.LogLevel
 import com.example.model.PerAppProxyMode
+import com.example.model.RamThreadGuide
 import com.example.model.VpnConfig
 import com.example.model.VpnStatus
 import com.example.model.VpnTelemetry
@@ -91,6 +93,9 @@ class MainViewModel(
 
   private val _isLoadingApps = MutableStateFlow(false)
   val isLoadingApps: StateFlow<Boolean> = _isLoadingApps.asStateFlow()
+
+  private val _deviceRamGb = MutableStateFlow(4)
+  val deviceRamGb: StateFlow<Int> = _deviceRamGb.asStateFlow()
 
   private val defaultCleanIps =
     listOf(
@@ -192,6 +197,25 @@ class MainViewModel(
         }
       _installedApps.value = apps
       _isLoadingApps.value = false
+    }
+  }
+
+  fun detectDeviceRam(context: Context) {
+    runCatching {
+      val am = context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager ?: return
+      val memInfo = ActivityManager.MemoryInfo()
+      am.getMemoryInfo(memInfo)
+      val totalGb = kotlin.math.ceil(memInfo.totalMem / (1024.0 * 1024.0 * 1024.0)).toInt().coerceAtLeast(2)
+      _deviceRamGb.value = totalGb
+    }
+  }
+
+  fun setWorkerThreads(count: Int, onSaved: (() -> Unit)? = null) {
+    val clamped = count.coerceIn(RamThreadGuide.MIN_THREADS, RamThreadGuide.MAX_THREADS)
+    viewModelScope.launch {
+      configRepo.setWorkerThreads(clamped)
+      stateRepo.log(LogLevel.INFO, "PERF", "Worker threads updated → $clamped concurrent workers")
+      onSaved?.invoke()
     }
   }
 
@@ -379,9 +403,10 @@ class MainViewModel(
       val candidates = _cleanIpResults.value.map { it.ip }
       _cleanIpResults.value = candidates.map { CleanIpTestResult(ip = it, isTesting = true) }
 
+      val concurrency = settings.value.workerThreads.coerceIn(2, 16)
       val results =
         candidates
-          .chunked(4)
+          .chunked(concurrency)
           .flatMap { batch ->
             batch
               .map { ip ->

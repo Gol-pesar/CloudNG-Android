@@ -194,7 +194,7 @@ class DnsHandler(
     suspend fun query(dnsQuery: ByteArray): ByteArray? {
       if (!acked || ws == null) {
         val ready = ensureConnected(forceNow = true)
-        val ok = ready?.let { withTimeoutOrNull(1_500L) { it.await() } } ?: false
+        val ok = ready?.let { withTimeoutOrNull(3_000L) { it.await() } } ?: false
         if (!ok || !acked) return null
       }
 
@@ -226,7 +226,7 @@ class DnsHandler(
         return null
       }
 
-      val resp = withTimeoutOrNull(1_500L) { deferred.await() }
+      val resp = withTimeoutOrNull(2_500L) { deferred.await() }
       pending.remove(internalId)
       if (resp == null || resp.size < 12) return null
       resp[0] = origId0
@@ -378,7 +378,7 @@ class DnsHandler(
 
     val request = WorkerProtocol.buildWebSocketRequest(parsedWorkerUrl, cleanIp)
     return try {
-      withTimeout(2_000L) {
+      withTimeout(3_000L) {
         suspendCancellableCoroutine { cont ->
           var acked = false
           var key = ByteArray(0)

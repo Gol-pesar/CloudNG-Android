@@ -74,10 +74,12 @@ import com.example.model.AppLanguage
 import com.example.model.DarkThemeMode
 import com.example.model.VpnConfig
 import com.example.model.VpnStatus
+import androidx.compose.runtime.LaunchedEffect
 import com.example.ui.components.CloudNgBrandMark
 import com.example.ui.components.PerAppProxyDialog
 import com.example.ui.components.QrExportDialog
 import com.example.ui.components.QrScannerDialog
+import com.example.ui.components.WorkerThreadsDialog
 import com.example.ui.screens.ConnectScreen
 import com.example.ui.screens.LogsSettingsScreen
 import com.example.ui.screens.ProfilesScreen
@@ -121,10 +123,16 @@ fun EdgeTunnelRoot(viewModel: MainViewModel) {
   val logs by viewModel.logs.collectAsStateWithLifecycle()
   val installedApps by viewModel.installedApps.collectAsStateWithLifecycle()
   val isLoadingApps by viewModel.isLoadingApps.collectAsStateWithLifecycle()
+  val deviceRamGb by viewModel.deviceRamGb.collectAsStateWithLifecycle()
 
   var qrExportTarget by remember { mutableStateOf<VpnConfig?>(null) }
   var showQrScanner by remember { mutableStateOf(false) }
   var showPerAppDialog by remember { mutableStateOf(false) }
+  var showWorkerThreadsDialog by remember { mutableStateOf(false) }
+
+  LaunchedEffect(Unit) {
+    viewModel.detectDeviceRam(context)
+  }
 
   val strings = stringsFor(settings.language)
   val layoutDirection =
@@ -409,6 +417,10 @@ fun EdgeTunnelRoot(viewModel: MainViewModel) {
                       viewModel.loadInstalledApps(context)
                       showPerAppDialog = true
                     },
+                    onOpenWorkerThreads = {
+                      viewModel.detectDeviceRam(context)
+                      showWorkerThreadsDialog = true
+                    },
                     onImportClipboard = { importFromClipboard() },
                     onOpenQrScanner = { showQrScanner = true },
                     onExportClipboard = { exportToClipboard(it) },
@@ -447,6 +459,7 @@ fun EdgeTunnelRoot(viewModel: MainViewModel) {
                 composable(ROUTE_LOGS) {
                   LogsSettingsScreen(
                     settings = settings,
+                    deviceRamGb = deviceRamGb,
                     logs = logs,
                     onLanguageChange = viewModel::setLanguage,
                     onDnsChange = viewModel::setDnsServer,
@@ -454,6 +467,10 @@ fun EdgeTunnelRoot(viewModel: MainViewModel) {
                     onOpenPerAppProxy = {
                       viewModel.loadInstalledApps(context)
                       showPerAppDialog = true
+                    },
+                    onOpenWorkerThreads = {
+                      viewModel.detectDeviceRam(context)
+                      showWorkerThreadsDialog = true
                     },
                     onThemeChange = viewModel::setThemeMode,
                     onClearLogs = viewModel::clearLogs,
@@ -506,6 +523,22 @@ fun EdgeTunnelRoot(viewModel: MainViewModel) {
             }
           },
           onDismiss = { showPerAppDialog = false },
+        )
+      }
+
+      if (showWorkerThreadsDialog) {
+        WorkerThreadsDialog(
+          initialThreads = settings.workerThreads,
+          deviceRamGb = deviceRamGb,
+          language = settings.language,
+          onSave = { count ->
+            showWorkerThreadsDialog = false
+            viewModel.setWorkerThreads(count) {
+              showMsg(strings.workerThreadsAppliedMsg(count))
+              WorkerVpnService.restartIfRunning(context)
+            }
+          },
+          onDismiss = { showWorkerThreadsDialog = false },
         )
       }
     }

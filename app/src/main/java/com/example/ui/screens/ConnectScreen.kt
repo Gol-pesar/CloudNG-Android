@@ -7,6 +7,8 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -78,6 +80,7 @@ import com.example.ui.strings.LocalAppStrings
 import com.example.ui.theme.JetBrainsMonoFontFamily
 import com.example.ui.viewmodel.DraftFieldsState
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun ConnectScreen(
   activeConfig: VpnConfig?,
@@ -94,6 +97,7 @@ fun ConnectScreen(
   onToggleVpn: () -> Unit,
   onOpenCleanIpScanner: () -> Unit,
   onOpenPerAppProxy: () -> Unit,
+  onOpenWorkerThreads: () -> Unit,
   onImportClipboard: () -> Unit,
   onOpenQrScanner: () -> Unit,
   onExportClipboard: (VpnConfig) -> Unit,
@@ -128,10 +132,19 @@ fun ConnectScreen(
             onExportClipboard = onExportClipboard,
             onExportQr = onExportQr,
           )
-          PerAppQuickPill(
-            settings = settings,
-            onClick = onOpenPerAppProxy,
-          )
+          FlowRow(
+            horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+          ) {
+            PerAppQuickPill(
+              settings = settings,
+              onClick = onOpenPerAppProxy,
+            )
+            WorkerThreadsQuickPill(
+              threadCount = settings.workerThreads,
+              onClick = onOpenWorkerThreads,
+            )
+          }
           ConnectionOrb(
             status = telemetry.status,
             elapsedSeconds = elapsedSeconds,
@@ -175,10 +188,19 @@ fun ConnectScreen(
           modifier = Modifier.widthIn(max = 560.dp),
         )
 
-        PerAppQuickPill(
-          settings = settings,
-          onClick = onOpenPerAppProxy,
-        )
+        FlowRow(
+          horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally),
+          verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+          PerAppQuickPill(
+            settings = settings,
+            onClick = onOpenPerAppProxy,
+          )
+          WorkerThreadsQuickPill(
+            threadCount = settings.workerThreads,
+            onClick = onOpenWorkerThreads,
+          )
+        }
 
         ConnectionOrb(
           status = telemetry.status,
@@ -205,6 +227,41 @@ fun ConnectScreen(
 
         Spacer(modifier = Modifier.height(12.dp))
       }
+    }
+  }
+}
+
+@Composable
+private fun WorkerThreadsQuickPill(
+  threadCount: Int,
+  onClick: () -> Unit,
+) {
+  val strings = LocalAppStrings.current
+  Surface(
+    onClick = onClick,
+    color = MaterialTheme.colorScheme.surface,
+    shape = MaterialTheme.shapes.extraLarge,
+    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+    modifier = Modifier.testTag("connect_worker_threads_pill"),
+  ) {
+    Row(
+      modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
+      verticalAlignment = Alignment.CenterVertically,
+      horizontalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+      Icon(
+        imageVector = Icons.Rounded.Speed,
+        contentDescription = strings.workerThreadsTitle,
+        tint = MaterialTheme.colorScheme.secondary,
+        modifier = Modifier.size(16.dp),
+      )
+      Text(
+        text = strings.workerThreadsShortPill(threadCount),
+        style = MaterialTheme.typography.labelMedium,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        maxLines = 1,
+        overflow = TextOverflow.Ellipsis,
+      )
     }
   }
 }

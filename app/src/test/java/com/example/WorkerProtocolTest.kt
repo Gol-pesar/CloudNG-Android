@@ -1,5 +1,6 @@
 package com.example
 
+import com.example.model.RamThreadGuide
 import com.example.protocol.WorkerProtocol
 import com.example.vpn.Ipv4Packet
 import org.junit.Assert.assertArrayEquals
@@ -182,5 +183,24 @@ class WorkerProtocolTest {
     assertNotNull(parsed)
     assertEquals(16384, parsed!!.tcpWindow)
     assertEquals(7, Ipv4Packet.parseTcpWindowScale(pkt, parsed))
+  }
+
+  @Test
+  fun `ram thread guide recommends safe thread counts by device RAM`() {
+    assertEquals(4, RamThreadGuide.specForRamGb(2).recommendedThreads)
+    assertEquals(6, RamThreadGuide.specForRamGb(4).recommendedThreads)
+    assertEquals(10, RamThreadGuide.specForRamGb(6).recommendedThreads)
+    assertEquals(16, RamThreadGuide.specForRamGb(8).recommendedThreads)
+    assertEquals(16, RamThreadGuide.specForRamGb(12).recommendedThreads)
+  }
+
+  @Test
+  fun `xor fast path handles 16-byte keys identically`() {
+    val key16 = ByteArray(16) { (it * 13 + 5).toByte() }
+    val data = ByteArray(257) { (it xor 0x5A).toByte() }
+    val enc = WorkerProtocol.xorBuf(data, key16)
+    val dec = enc.copyOf()
+    WorkerProtocol.xorInPlace(dec, key16)
+    assertArrayEquals(data, dec)
   }
 }

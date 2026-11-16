@@ -36,8 +36,15 @@ object WorkerProtocol {
   fun xorBuf(data: ByteArray, key: ByteArray): ByteArray {
     if (key.isEmpty()) return data.copyOf()
     val out = ByteArray(data.size)
-    for (i in data.indices) {
-      out[i] = (data[i].toInt() xor key[i % key.size].toInt()).toByte()
+    val kLen = key.size
+    if (kLen == 16) {
+      for (i in data.indices) {
+        out[i] = (data[i].toInt() xor key[i and 15].toInt()).toByte()
+      }
+    } else {
+      for (i in data.indices) {
+        out[i] = (data[i].toInt() xor key[i % kLen].toInt()).toByte()
+      }
     }
     return out
   }
@@ -45,8 +52,14 @@ object WorkerProtocol {
   fun xorInPlace(data: ByteArray, key: ByteArray): ByteArray {
     if (key.isEmpty()) return data
     val kLen = key.size
-    for (i in data.indices) {
-      data[i] = (data[i].toInt() xor key[i % kLen].toInt()).toByte()
+    if (kLen == 16) {
+      for (i in data.indices) {
+        data[i] = (data[i].toInt() xor key[i and 15].toInt()).toByte()
+      }
+    } else {
+      for (i in data.indices) {
+        data[i] = (data[i].toInt() xor key[i % kLen].toInt()).toByte()
+      }
     }
     return data
   }
@@ -201,16 +214,30 @@ object WorkerProtocol {
     cleanIp: ParsedCleanIp?,
     socketFactory: SocketFactory? = null,
     connectTimeoutSec: Long = 8L,
+    workerThreads: Int = 8,
     fallbackDnsLookup: ((String) -> List<InetAddress>)? = null,
   ): OkHttpClient {
+    val threads = workerThreads.coerceIn(2, 32)
+    val executor =
+      java.util.concurrent.ThreadPoolExecutor(
+        threads,
+        (threads * 4).coerceAtLeast(32),
+        60L,
+        TimeUnit.SECONDS,
+        java.util.concurrent.SynchronousQueue(),
+        okhttp3.internal.threadFactory("CloudNG-Worker", false),
+      )
     val dispatcher =
-      okhttp3.Dispatcher().apply {
-        maxRequests = 256
-        maxRequestsPerHost = 64
+      okhttp3.Dispatcher(executor).apply {
+        maxRequests = (threads * 16).coerceIn(128, 512)
+        maxRequestsPerHost = (threads * 8).coerceIn(32, 256)
       }
     val builder =
       OkHttpClient.Builder()
         .dispatcher(dispatcher)
+        .connectionPool(
+          okhttp3.ConnectionPool((threads * 2).coerceIn(12, 64), 120L, TimeUnit.SECONDS)
+        )
         .protocols(listOf(okhttp3.Protocol.HTTP_1_1))
         .connectTimeout(connectTimeoutSec, TimeUnit.SECONDS)
         .readTimeout(0, TimeUnit.SECONDS)

@@ -19,6 +19,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Apps
 import androidx.compose.material.icons.rounded.ContentCopy
 import androidx.compose.material.icons.rounded.DeleteSweep
+import androidx.compose.material.icons.rounded.Speed
 import androidx.compose.material.icons.rounded.Terminal
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -51,6 +52,7 @@ import com.example.model.AppSettings
 import com.example.model.DarkThemeMode
 import com.example.model.LogEntry
 import com.example.model.LogLevel
+import com.example.model.RamThreadGuide
 import com.example.ui.strings.LocalAppStrings
 import com.example.ui.theme.JetBrainsMonoFontFamily
 import java.text.SimpleDateFormat
@@ -60,11 +62,13 @@ import java.util.Locale
 @Composable
 fun LogsSettingsScreen(
   settings: AppSettings,
+  deviceRamGb: Int,
   logs: List<LogEntry>,
   onLanguageChange: (AppLanguage) -> Unit,
   onDnsChange: (String) -> Unit,
   onBypassLanChange: (Boolean) -> Unit,
   onOpenPerAppProxy: () -> Unit,
+  onOpenWorkerThreads: () -> Unit,
   onThemeChange: (DarkThemeMode) -> Unit,
   onClearLogs: () -> Unit,
   onShowMessage: (String) -> Unit,
@@ -211,6 +215,46 @@ fun LogsSettingsScreen(
               )
               Spacer(modifier = Modifier.width(6.dp))
               Text(strings.perAppManageButton)
+            }
+          }
+
+          HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+
+          // Concurrent Worker Threads + RAM recommendation
+          val recThreads = remember(deviceRamGb) { RamThreadGuide.specForRamGb(deviceRamGb).recommendedThreads }
+          Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+          ) {
+            Column(modifier = Modifier.weight(1f).padding(end = 12.dp)) {
+              Text(
+                text = strings.workerThreadsTitle,
+                style = MaterialTheme.typography.bodyLarge,
+                color = MaterialTheme.colorScheme.onSurface,
+              )
+              Text(
+                text = strings.workerThreadsSummary(settings.workerThreads, recThreads),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.primary,
+              )
+              Text(
+                text = strings.workerThreadsDesc,
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+              )
+            }
+            OutlinedButton(
+              onClick = onOpenWorkerThreads,
+              modifier = Modifier.minimumInteractiveComponentSize().testTag("open_worker_threads_settings_button"),
+            ) {
+              Icon(
+                imageVector = Icons.Rounded.Speed,
+                contentDescription = null,
+                modifier = Modifier.size(16.dp),
+              )
+              Spacer(modifier = Modifier.width(6.dp))
+              Text(strings.workerThreadsManageButton)
             }
           }
 

@@ -5,6 +5,7 @@ import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
+import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.core.stringSetPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
@@ -12,6 +13,7 @@ import com.example.model.AppLanguage
 import com.example.model.AppSettings
 import com.example.model.DarkThemeMode
 import com.example.model.PerAppProxyMode
+import com.example.model.RamThreadGuide
 import com.example.model.VpnConfig
 import com.example.protocol.WorkerProtocol
 import kotlinx.coroutines.flow.Flow
@@ -35,6 +37,7 @@ class ConfigRepository(private val context: Context) {
     val THEME_MODE = stringPreferencesKey("theme_mode")
     val PER_APP_MODE = stringPreferencesKey("per_app_mode")
     val PER_APP_PACKAGES = stringSetPreferencesKey("per_app_packages")
+    val WORKER_THREADS = intPreferencesKey("worker_threads")
   }
 
   val profilesFlow: Flow<List<VpnConfig>> =
@@ -67,6 +70,11 @@ class ConfigRepository(private val context: Context) {
       val perAppKey = prefs[Keys.PER_APP_MODE] ?: PerAppProxyMode.ALL.key
       val perAppMode = PerAppProxyMode.entries.firstOrNull { it.key == perAppKey } ?: PerAppProxyMode.ALL
       val perAppPackages = prefs[Keys.PER_APP_PACKAGES] ?: emptySet()
+      val workerThreads =
+        (prefs[Keys.WORKER_THREADS] ?: 8).coerceIn(
+          RamThreadGuide.MIN_THREADS,
+          RamThreadGuide.MAX_THREADS,
+        )
       AppSettings(
         language = lang,
         dnsServer = prefs[Keys.DNS_SERVER] ?: "1.1.1.1",
@@ -74,6 +82,7 @@ class ConfigRepository(private val context: Context) {
         themeMode = theme,
         perAppMode = perAppMode,
         perAppPackages = perAppPackages,
+        workerThreads = workerThreads,
       )
     }
 
@@ -215,6 +224,11 @@ class ConfigRepository(private val context: Context) {
       prefs[Keys.PER_APP_MODE] = mode.key
       prefs[Keys.PER_APP_PACKAGES] = packages
     }
+  }
+
+  suspend fun setWorkerThreads(count: Int) {
+    val clamped = count.coerceIn(RamThreadGuide.MIN_THREADS, RamThreadGuide.MAX_THREADS)
+    context.dataStore.edit { it[Keys.WORKER_THREADS] = clamped }
   }
 
   fun exportShareUri(config: VpnConfig): String {

@@ -18,6 +18,9 @@ import okio.ByteString.Companion.toByteString
 import java.io.ByteArrayOutputStream
 import java.util.TreeMap
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.random.Random
 
@@ -29,16 +32,31 @@ class TcpSessionManager(
   private val sharedWorkerClient: OkHttpClient,
   private val dnsHandler: DnsHandler,
   private val vpnStateRepository: VpnStateRepository,
+  workerThreads: Int = 8,
   private val writeToTun: (ByteArray) -> Unit,
 ) {
   companion object {
-    private const val MSS = 1360
+    private const val MSS = 1400
     private const val SERVER_WINDOW_SCALE = 7 // 128x multiplier -> 16384 * 128 = 2 MB window
     private const val SCALED_ACK_WINDOW = 16384
     private const val SESSION_IDLE_MS = 120_000L
-    private const val WS_BACKPRESSURE_LIMIT_BYTES = 2 * 1024 * 1024L
-    private const val MAX_OOO_SEGMENTS = 24
+    private const val WS_BACKPRESSURE_LIMIT_BYTES = 3 * 1024 * 1024L
+    private const val MAX_OOO_SEGMENTS = 32
   }
+
+  private val threadCount = workerThreads.coerceIn(2, 32)
+  private val laneIdCounter = AtomicInteger(0)
+  private val workerLanes: Array<ExecutorService> =
+    Array(threadCount) {
+      Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable, "CloudNG-Lane-${laneIdCounter.incrementAndGet()}").apply {
+          isDaemon = true
+          priority = Thread.MAX_PRIORITY
+        }
+      }
+    }
+
+  @Volatile private var isShutdown = false
 
   data class TcpKey(
     val srcIp: Int,
@@ -72,7 +90,10 @@ class TcpSessionManager(
     private var unackedClientBytes = 0
     private val pendingPreOpen = ByteArrayOutputStream()
     private val oooBuffer = TreeMap<Long, ByteArray>()
-    private val sessionLock = Any()
+
+    // Separate upload and downlink-TUN locks so full-duplex transfers never block each other
+    private val uploadLock = Any()
+    private val tunTxLock = Any()
 
     fun touch() {
       lastActivityMs = System.currentTimeMillis()
@@ -99,7 +120,7 @@ class TcpSessionManager(
           request,
           object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
-              synchronized(sessionLock) {
+              synchronized(uploadLock) {
                 if (state == State.CLOSED) {
                   webSocket.cancel()
                   return
@@ -253,7 +274,7 @@ class TcpSessionManager(
       clientNextSeq = (clientNextSeq + payload.size) and 0xFFFFFFFFL
       txBytes.addAndGet(payload.size.toLong())
       val activeWs = ws
-      synchronized(sessionLock) {
+      synchronized(uploadLock) {
         if (state == State.CLOSED) return
         if (!initSent) {
           pendingPreOpen.write(payload)
@@ -265,7 +286,7 @@ class TcpSessionManager(
     }
 
     private fun sendSynAck() {
-      synchronized(sessionLock) {
+      synchronized(tunTxLock) {
         if (state == State.CLOSED) return
         val pkt =
           Ipv4Packet.buildTcpPacket(
@@ -286,7 +307,7 @@ class TcpSessionManager(
     }
 
     private fun sendAck(window: Int) {
-      synchronized(sessionLock) {
+      synchronized(tunTxLock) {
         if (state == State.CLOSED) return
         val pkt =
           Ipv4Packet.buildTcpPacket(
@@ -304,9 +325,10 @@ class TcpSessionManager(
     }
 
     private fun sendDataChunksToTun(data: ByteArray) {
-      synchronized(sessionLock) {
+      synchronized(tunTxLock) {
         if (state == State.CLOSED) return
         val wnd = currentAdvertisedWindow(ws)
+        val seqAck = clientNextSeq
         var off = 0
         while (off < data.size) {
           val chunkLen = (data.size - off).coerceAtMost(MSS)
@@ -321,7 +343,7 @@ class TcpSessionManager(
               srcPort = key.dstPort,
               dstPort = key.srcPort,
               seq = serverSeq,
-              ack = clientNextSeq,
+              ack = seqAck,
               flags = flags,
               window = wnd,
               payload = data,
@@ -336,7 +358,7 @@ class TcpSessionManager(
     }
 
     private fun sendFinAck() {
-      synchronized(sessionLock) {
+      synchronized(tunTxLock) {
         if (state == State.CLOSED) return
         val pkt =
           Ipv4Packet.buildTcpPacket(
@@ -355,7 +377,7 @@ class TcpSessionManager(
     }
 
     private fun sendRstAck() {
-      synchronized(sessionLock) {
+      synchronized(tunTxLock) {
         val pkt =
           Ipv4Packet.buildTcpPacket(
             srcIp = key.dstIp,
@@ -371,7 +393,7 @@ class TcpSessionManager(
     }
 
     fun closeInternal() {
-      synchronized(sessionLock) {
+      synchronized(uploadLock) {
         if (state == State.CLOSED) return
         state = State.CLOSED
         pendingPreOpen.reset()
@@ -404,7 +426,25 @@ class TcpSessionManager(
   fun activeCount(): Int = sessions.size
 
   fun handleTcpPacket(raw: ByteArray, parsed: Ipv4Packet.ParsedPacket) {
+    if (isShutdown) return
     val key = TcpKey(parsed.srcIp, parsed.srcPort, parsed.dstIp, parsed.dstPort)
+    val packetCopy = raw.copyOfRange(0, parsed.totalLength)
+    val lane = workerLanes[(key.hashCode() and 0x7FFFFFFF) % threadCount]
+
+    runCatching {
+      lane.execute {
+        if (!isShutdown) {
+          processPacketOnLane(key, packetCopy, parsed)
+        }
+      }
+    }
+  }
+
+  private fun processPacketOnLane(
+    key: TcpKey,
+    raw: ByteArray,
+    parsed: Ipv4Packet.ParsedPacket,
+  ) {
     val isSynOnly =
       (parsed.tcpFlags and Ipv4Packet.TCP_SYN) != 0 &&
         (parsed.tcpFlags and Ipv4Packet.TCP_ACK) == 0
@@ -417,7 +457,11 @@ class TcpSessionManager(
       val session = TcpSession(key, targetHost, parsed.tcpSeq, negotiateWindowScale = clientWs != null)
       sessions[key] = session
       if (vpnStateRepository.wantsTrafficLog()) {
-        vpnStateRepository.log(LogLevel.TRAFFIC, "TUN", "0-RTT dial → $targetHost:${parsed.dstPort}")
+        vpnStateRepository.log(
+          LogLevel.TRAFFIC,
+          "TUN",
+          "0-RTT (${threadCount}T) → $targetHost:${parsed.dstPort}",
+        )
       }
       session.startTunnelOptimistic()
       return
@@ -442,8 +486,12 @@ class TcpSessionManager(
   }
 
   fun shutdown() {
+    isShutdown = true
     sessions.values.toList().forEach { it.closeInternal() }
     sessions.clear()
+    for (lane in workerLanes) {
+      runCatching { lane.shutdownNow() }
+    }
   }
 
   private fun isSeqBefore(a: Long, b: Long): Boolean {
