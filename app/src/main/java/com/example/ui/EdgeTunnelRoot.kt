@@ -75,6 +75,7 @@ import com.example.model.DarkThemeMode
 import com.example.model.VpnConfig
 import com.example.model.VpnStatus
 import com.example.ui.components.CloudNgBrandMark
+import com.example.ui.components.PerAppProxyDialog
 import com.example.ui.components.QrExportDialog
 import com.example.ui.components.QrScannerDialog
 import com.example.ui.screens.ConnectScreen
@@ -118,9 +119,12 @@ fun EdgeTunnelRoot(viewModel: MainViewModel) {
   val cleanIpResults by viewModel.cleanIpResults.collectAsStateWithLifecycle()
   val isScanningCleanIps by viewModel.isScanningCleanIps.collectAsStateWithLifecycle()
   val logs by viewModel.logs.collectAsStateWithLifecycle()
+  val installedApps by viewModel.installedApps.collectAsStateWithLifecycle()
+  val isLoadingApps by viewModel.isLoadingApps.collectAsStateWithLifecycle()
 
   var qrExportTarget by remember { mutableStateOf<VpnConfig?>(null) }
   var showQrScanner by remember { mutableStateOf(false) }
+  var showPerAppDialog by remember { mutableStateOf(false) }
 
   val strings = stringsFor(settings.language)
   val layoutDirection =
@@ -380,6 +384,7 @@ fun EdgeTunnelRoot(viewModel: MainViewModel) {
                 composable(ROUTE_CONNECT) {
                   ConnectScreen(
                     activeConfig = activeConfig,
+                    settings = settings,
                     draft = draft,
                     telemetry = telemetry,
                     elapsedSeconds = elapsedSeconds,
@@ -400,6 +405,10 @@ fun EdgeTunnelRoot(viewModel: MainViewModel) {
                     },
                     onToggleVpn = { startOrStopVpn() },
                     onOpenCleanIpScanner = { navigateTab(ROUTE_PROFILES) },
+                    onOpenPerAppProxy = {
+                      viewModel.loadInstalledApps(context)
+                      showPerAppDialog = true
+                    },
                     onImportClipboard = { importFromClipboard() },
                     onOpenQrScanner = { showQrScanner = true },
                     onExportClipboard = { exportToClipboard(it) },
@@ -442,6 +451,10 @@ fun EdgeTunnelRoot(viewModel: MainViewModel) {
                     onLanguageChange = viewModel::setLanguage,
                     onDnsChange = viewModel::setDnsServer,
                     onBypassLanChange = viewModel::setBypassLan,
+                    onOpenPerAppProxy = {
+                      viewModel.loadInstalledApps(context)
+                      showPerAppDialog = true
+                    },
                     onThemeChange = viewModel::setThemeMode,
                     onClearLogs = viewModel::clearLogs,
                     onShowMessage = { msg -> showMsg(msg) },
@@ -475,6 +488,24 @@ fun EdgeTunnelRoot(viewModel: MainViewModel) {
           },
           onScanFailed = { err -> showMsg(err) },
           onDismiss = { showQrScanner = false },
+        )
+      }
+
+      if (showPerAppDialog) {
+        PerAppProxyDialog(
+          initialMode = settings.perAppMode,
+          initialPackages = settings.perAppPackages,
+          installedApps = installedApps,
+          isLoadingApps = isLoadingApps,
+          onRefreshApps = { viewModel.loadInstalledApps(context) },
+          onSave = { mode, packages ->
+            showPerAppDialog = false
+            viewModel.setPerAppProxy(mode, packages) {
+              showMsg(strings.perAppAppliedMsg)
+              WorkerVpnService.restartIfRunning(context)
+            }
+          },
+          onDismiss = { showPerAppDialog = false },
         )
       }
     }

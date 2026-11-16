@@ -3,6 +3,7 @@ package com.example.ui.strings
 import androidx.compose.runtime.Immutable
 import androidx.compose.runtime.staticCompositionLocalOf
 import com.example.model.AppLanguage
+import com.example.model.PerAppProxyMode
 
 @Immutable
 data class AppStrings(
@@ -82,6 +83,19 @@ data class AppStrings(
   val dnsLabel: String,
   val bypassLanLabel: String,
   val bypassLanDesc: String,
+  val perAppProxyTitle: String,
+  val perAppProxyDesc: String,
+  val perAppManageButton: String,
+  val perAppModeAll: String,
+  val perAppModeBypass: String,
+  val perAppModeAllowOnly: String,
+  val perAppSelfBypassNotice: String,
+  val perAppSearchHint: String,
+  val perAppSelectedCount: (Int) -> String,
+  val perAppClearSelection: String,
+  val perAppNoAppsMatch: String,
+  val perAppSummary: (PerAppProxyMode, Int) -> String,
+  val perAppAppliedMsg: String,
   val themeLabel: String,
   val themeDark: String,
   val themeLight: String,
@@ -168,6 +182,27 @@ val PersianStrings =
     dnsLabel = "سرور DNS",
     bypassLanLabel = "عبور مستقیم شبکه داخلی (Bypass LAN)",
     bypassLanDesc = "ترافیک رنج‌های خصوصی از تونل عبور نمی‌کند",
+    perAppProxyTitle = "پروکسی هوشمند برنامه‌ها (Per-App Proxy)",
+    perAppProxyDesc = "تعیین کنید کدام برنامه‌ها از تونل عبور کنند یا مستقیماً به شبکه وصل شوند",
+    perAppManageButton = "انتخاب برنامه‌ها",
+    perAppModeAll = "همه برنامه‌ها",
+    perAppModeBypass = "استثنا کردن",
+    perAppModeAllowOnly = "فقط منتخب‌ها",
+    perAppSelfBypassNotice = "خود CloudNG همیشه خارج از تونل و مستقیماً روی اینترنت/وای‌فای اجرا می‌شود.",
+    perAppSearchHint = "جستجوی نام یا پکیج برنامه…",
+    perAppSelectedCount = { count -> "$count برنامه انتخاب شده" },
+    perAppClearSelection = "پاک کردن انتخاب‌ها",
+    perAppNoAppsMatch = "برنامه‌ای با این نام پیدا نشد",
+    perAppSummary = { mode, count ->
+      when (mode) {
+        PerAppProxyMode.ALL -> "همه برنامه‌ها داخل تونل • CloudNG مستثنی"
+        PerAppProxyMode.BYPASS -> "مستثنی کردن $count برنامه • بقیه از تونل"
+        PerAppProxyMode.ALLOW_ONLY ->
+          if (count == 0) "منتخب‌ها خالی است (حالت پیش‌فرض همه برنامه‌ها)"
+          else "فقط $count برنامه انتخاب‌شده از تونل عبور می‌کنند"
+      }
+    },
+    perAppAppliedMsg = "تنظیمات Per-App Proxy ذخیره شد",
     themeLabel = "پوسته برنامه",
     themeDark = "تیره",
     themeLight = "روشن",
@@ -254,6 +289,27 @@ val EnglishStrings =
     dnsLabel = "DNS Server",
     bypassLanLabel = "Bypass LAN Subnets",
     bypassLanDesc = "Private network ranges bypass the VPN tunnel",
+    perAppProxyTitle = "Per-App Proxy",
+    perAppProxyDesc = "Choose which apps route through the VPN or bypass directly",
+    perAppManageButton = "Configure Apps",
+    perAppModeAll = "All Apps",
+    perAppModeBypass = "Bypass",
+    perAppModeAllowOnly = "Only Selected",
+    perAppSelfBypassNotice = "CloudNG itself is always excluded from the VPN and connects directly over your Wi-Fi / Cellular network.",
+    perAppSearchHint = "Search app name or package…",
+    perAppSelectedCount = { count -> "$count app(s) selected" },
+    perAppClearSelection = "Clear selection",
+    perAppNoAppsMatch = "No matching apps found",
+    perAppSummary = { mode, count ->
+      when (mode) {
+        PerAppProxyMode.ALL -> "All apps tunneled • CloudNG self-bypassed"
+        PerAppProxyMode.BYPASS -> "Bypassing $count selected app(s)"
+        PerAppProxyMode.ALLOW_ONLY ->
+          if (count == 0) "No apps selected (all other apps tunneled)"
+          else "Only $count selected app(s) use the tunnel"
+      }
+    },
+    perAppAppliedMsg = "Per-App Proxy settings saved",
     themeLabel = "Theme",
     themeDark = "Dark",
     themeLight = "Light",

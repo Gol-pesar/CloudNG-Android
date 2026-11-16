@@ -201,6 +201,7 @@ object WorkerProtocol {
     cleanIp: ParsedCleanIp?,
     socketFactory: SocketFactory? = null,
     connectTimeoutSec: Long = 8L,
+    fallbackDnsLookup: ((String) -> List<InetAddress>)? = null,
   ): OkHttpClient {
     val dispatcher =
       okhttp3.Dispatcher().apply {
@@ -210,6 +211,7 @@ object WorkerProtocol {
     val builder =
       OkHttpClient.Builder()
         .dispatcher(dispatcher)
+        .protocols(listOf(okhttp3.Protocol.HTTP_1_1))
         .connectTimeout(connectTimeoutSec, TimeUnit.SECONDS)
         .readTimeout(0, TimeUnit.SECONDS)
         .writeTimeout(15, TimeUnit.SECONDS)
@@ -219,18 +221,20 @@ object WorkerProtocol {
       builder.socketFactory(socketFactory)
     }
 
-    if (cleanIp != null) {
-      builder.dns(
-        object : Dns {
-          override fun lookup(hostname: String): List<InetAddress> {
-            if (hostname.equals(workerHost, ignoreCase = true)) {
-              return InetAddress.getAllByName(cleanIp.host).toList()
-            }
-            return Dns.SYSTEM.lookup(hostname)
+    builder.dns(
+      object : Dns {
+        override fun lookup(hostname: String): List<InetAddress> {
+          if (cleanIp != null && hostname.equals(workerHost, ignoreCase = true)) {
+            return InetAddress.getAllByName(cleanIp.host).toList()
           }
+          if (fallbackDnsLookup != null) {
+            val resolved = runCatching { fallbackDnsLookup(hostname) }.getOrNull()
+            if (!resolved.isNullOrEmpty()) return resolved
+          }
+          return Dns.SYSTEM.lookup(hostname)
         }
-      )
-    }
+      }
+    )
 
     return builder.build()
   }

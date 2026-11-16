@@ -20,6 +20,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.Apps
 import androidx.compose.material.icons.rounded.ArrowDownward
 import androidx.compose.material.icons.rounded.ArrowUpward
 import androidx.compose.material.icons.rounded.CheckCircle
@@ -65,6 +66,7 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
+import com.example.model.AppSettings
 import com.example.model.HandshakeTestResult
 import com.example.model.VpnConfig
 import com.example.model.VpnTelemetry
@@ -79,6 +81,7 @@ import com.example.ui.viewmodel.DraftFieldsState
 @Composable
 fun ConnectScreen(
   activeConfig: VpnConfig?,
+  settings: AppSettings,
   draft: DraftFieldsState,
   telemetry: VpnTelemetry,
   elapsedSeconds: Long,
@@ -90,6 +93,7 @@ fun ConnectScreen(
   onTestWorker: () -> Unit,
   onToggleVpn: () -> Unit,
   onOpenCleanIpScanner: () -> Unit,
+  onOpenPerAppProxy: () -> Unit,
   onImportClipboard: () -> Unit,
   onOpenQrScanner: () -> Unit,
   onExportClipboard: (VpnConfig) -> Unit,
@@ -123,6 +127,10 @@ fun ConnectScreen(
             onOpenQrScanner = onOpenQrScanner,
             onExportClipboard = onExportClipboard,
             onExportQr = onExportQr,
+          )
+          PerAppQuickPill(
+            settings = settings,
+            onClick = onOpenPerAppProxy,
           )
           ConnectionOrb(
             status = telemetry.status,
@@ -167,6 +175,11 @@ fun ConnectScreen(
           modifier = Modifier.widthIn(max = 560.dp),
         )
 
+        PerAppQuickPill(
+          settings = settings,
+          onClick = onOpenPerAppProxy,
+        )
+
         ConnectionOrb(
           status = telemetry.status,
           elapsedSeconds = elapsedSeconds,
@@ -192,6 +205,41 @@ fun ConnectScreen(
 
         Spacer(modifier = Modifier.height(12.dp))
       }
+    }
+  }
+}
+
+@Composable
+private fun PerAppQuickPill(
+  settings: AppSettings,
+  onClick: () -> Unit,
+) {
+  val strings = LocalAppStrings.current
+  Surface(
+    onClick = onClick,
+    color = MaterialTheme.colorScheme.surface,
+    shape = MaterialTheme.shapes.extraLarge,
+    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+    modifier = Modifier.testTag("connect_per_app_pill"),
+  ) {
+    Row(
+      modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
+      verticalAlignment = Alignment.CenterVertically,
+      horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+      Icon(
+        imageVector = Icons.Rounded.Apps,
+        contentDescription = strings.perAppProxyTitle,
+        tint = MaterialTheme.colorScheme.primary,
+        modifier = Modifier.size(16.dp),
+      )
+      Text(
+        text = strings.perAppSummary(settings.perAppMode, settings.perAppPackages.size),
+        style = MaterialTheme.typography.labelMedium,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        maxLines = 1,
+        overflow = TextOverflow.Ellipsis,
+      )
     }
   }
 }

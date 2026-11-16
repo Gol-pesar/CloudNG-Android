@@ -7,7 +7,11 @@ import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.net.ConnectivityManager
 import android.net.IpPrefix
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
@@ -16,7 +20,9 @@ import androidx.core.app.NotificationCompat
 import com.example.EdgeTunnelApp
 import com.example.MainActivity
 import com.example.R
+import com.example.model.AppSettings
 import com.example.model.LogLevel
+import com.example.model.PerAppProxyMode
 import com.example.model.VpnConfig
 import com.example.model.VpnStatus
 import com.example.protocol.ParsedCleanIp
@@ -47,6 +53,7 @@ class WorkerVpnService : VpnService() {
   companion object {
     const val ACTION_START = "com.example.vpn.START"
     const val ACTION_STOP = "com.example.vpn.STOP"
+    const val ACTION_RESTART_IF_RUNNING = "com.example.vpn.RESTART_IF_RUNNING"
     private const val NOTIFICATION_ID = 4102
     private const val CHANNEL_ID = "edgetunnel_vpn_channel"
 
@@ -63,6 +70,14 @@ class WorkerVpnService : VpnService() {
       val intent = Intent(context, WorkerVpnService::class.java).apply { action = ACTION_STOP }
       context.startService(intent)
     }
+
+    fun restartIfRunning(context: Context) {
+      val intent =
+        Intent(context, WorkerVpnService::class.java).apply {
+          action = ACTION_RESTART_IF_RUNNING
+        }
+      runCatching { context.startService(intent) }
+    }
   }
 
   private val appContainer by lazy { (application as EdgeTunnelApp).container }
@@ -74,17 +89,34 @@ class WorkerVpnService : VpnService() {
   private var sharedWorkerClient: OkHttpClient? = null
   private var tcpManager: TcpSessionManager? = null
   private var dnsHandler: DnsHandler? = null
-  private val outboundQueue = ArrayBlockingQueue<ByteArray>(8192)
+  private var connectivityManager: ConnectivityManager? = null
+  private var underlyingCallback: ConnectivityManager.NetworkCallback? = null
+  @Volatile private var underlyingNetwork: Network? = null
+  @Volatile private var tunnelActive: Boolean = false
+  private val outboundQueue = ArrayBlockingQueue<ByteArray>(16384)
 
   override fun onCreate() {
     super.onCreate()
     ensureNotificationChannel()
+    connectivityManager = getSystemService(ConnectivityManager::class.java)
   }
 
   override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-    if (intent?.action == ACTION_STOP) {
-      stopTunnel()
-      return START_NOT_STICKY
+    when (intent?.action) {
+      ACTION_STOP -> {
+        stopTunnel()
+        return START_NOT_STICKY
+      }
+      ACTION_RESTART_IF_RUNNING -> {
+        if (!tunnelActive) {
+          stopSelf()
+          return START_NOT_STICKY
+        }
+        stateRepo.log(LogLevel.INFO, "VPN", "Applying updated tunnel / Per-App Proxy rules…")
+        promoteToForeground(getString(R.string.vpn_notif_connecting_title), "")
+        startTunnel()
+        return START_STICKY
+      }
     }
 
     promoteToForeground(getString(R.string.vpn_notif_connecting_title), "")
@@ -105,6 +137,9 @@ class WorkerVpnService : VpnService() {
 
   private fun startTunnel() {
     cleanupEngine()
+    tunnelActive = true
+    registerUnderlyingNetworkMonitor()
+
     val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     serviceScope = scope
 
@@ -117,6 +152,7 @@ class WorkerVpnService : VpnService() {
         val errMsg = "Worker URL and UUID are required"
         stateRepo.log(LogLevel.ERROR, "VPN", errMsg)
         stateRepo.updateStatus(VpnStatus.Error(errMsg))
+        tunnelActive = false
         stopSelf()
         return@launch
       }
@@ -135,11 +171,12 @@ class WorkerVpnService : VpnService() {
 
       val pfd =
         try {
-          establishTunInterface(settings.dnsServer, settings.bypassLan, config.mtu)
+          establishTunInterface(settings, config.mtu)
         } catch (e: Exception) {
           val msg = "TUN establish failed: ${e.message}"
           stateRepo.log(LogLevel.ERROR, "VPN", msg)
           stateRepo.updateStatus(VpnStatus.Error(msg))
+          tunnelActive = false
           stopSelf()
           return@launch
         }
@@ -148,24 +185,34 @@ class WorkerVpnService : VpnService() {
         val msg = "VPN interface not authorized"
         stateRepo.log(LogLevel.ERROR, "VPN", msg)
         stateRepo.updateStatus(VpnStatus.Error(msg))
+        tunnelActive = false
         stopSelf()
         return@launch
       }
       tunInterface = pfd
 
       val protectedFactory = createProtectedSocketFactory()
+      val underlyingDnsLookup: (String) -> List<InetAddress> = { host ->
+        val net = underlyingNetwork
+        val resolved =
+          if (net != null) runCatching { net.getAllByName(host).toList() }.getOrNull()
+          else null
+        if (!resolved.isNullOrEmpty()) resolved else InetAddress.getAllByName(host).toList()
+      }
+
       val workerClient =
         WorkerProtocol.createWorkerOkHttpClient(
           workerHost = parsedUrl.host,
           cleanIp = cleanIp,
           socketFactory = protectedFactory,
           connectTimeoutSec = 6L,
+          fallbackDnsLookup = underlyingDnsLookup,
         ).newBuilder()
-          .connectionPool(ConnectionPool(32, 90, TimeUnit.SECONDS))
+          .connectionPool(ConnectionPool(32, 120, TimeUnit.SECONDS))
           .build()
       sharedWorkerClient = workerClient
 
-      // Pre-warm TLS 1.3 session ticket & Cloudflare Worker isolate immediately
+      // Pre-warm TLS 1.3 session ticket & Cloudflare Worker isolate over underlying network
       scope.launch(Dispatchers.IO) {
         prewarmWorkerTls(workerClient, parsedUrl, cleanIp)
       }
@@ -185,6 +232,7 @@ class WorkerVpnService : VpnService() {
           cleanIp = cleanIp,
           dnsServerIp = settings.dnsServer.ifBlank { "1.1.1.1" },
           protectedSocketFactory = protectedFactory,
+          underlyingDnsLookup = underlyingDnsLookup,
           sharedWorkerClient = workerClient,
           vpnStateRepository = stateRepo,
           writeToTun = enqueueToTun,
@@ -212,7 +260,11 @@ class WorkerVpnService : VpnService() {
       val subtitle =
         if (cleanIp != null) "${parsedUrl.host} • ${cleanIp.host}" else parsedUrl.host
       promoteToForeground(getString(R.string.vpn_notif_connected_title), subtitle)
-      stateRepo.log(LogLevel.INFO, "VPN", "TUN interface established (MTU ${config.mtu})")
+      stateRepo.log(
+        LogLevel.INFO,
+        "VPN",
+        "TUN ready (MTU ${config.mtu}, self-bypass active, per-app=${settings.perAppMode.key})",
+      )
 
       // High-priority TUN writer loop
       scope.launch(Dispatchers.IO) {
@@ -288,6 +340,84 @@ class WorkerVpnService : VpnService() {
     }
   }
 
+  private fun registerUnderlyingNetworkMonitor() {
+    val cm = connectivityManager ?: return
+    underlyingNetwork = findBestUnderlyingNetwork(cm)
+
+    val request =
+      NetworkRequest.Builder()
+        .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+        .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+        .build()
+
+    val callback =
+      object : ConnectivityManager.NetworkCallback() {
+        override fun onAvailable(network: Network) {
+          val caps = runCatching { cm.getNetworkCapabilities(network) }.getOrNull()
+          if (caps != null && caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)) {
+            underlyingNetwork = network
+            updateServiceUnderlyingNetworks(network)
+          }
+        }
+
+        override fun onCapabilitiesChanged(network: Network, networkCapabilities: NetworkCapabilities) {
+          if (networkCapabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN) &&
+            networkCapabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+          ) {
+            underlyingNetwork = network
+            updateServiceUnderlyingNetworks(network)
+          }
+        }
+
+        override fun onLost(network: Network) {
+          if (underlyingNetwork == network) {
+            val next = findBestUnderlyingNetwork(cm, exclude = network)
+            underlyingNetwork = next
+            updateServiceUnderlyingNetworks(next)
+          }
+        }
+      }
+
+    underlyingCallback = callback
+    runCatching { cm.registerNetworkCallback(request, callback) }
+    updateServiceUnderlyingNetworks(underlyingNetwork)
+  }
+
+  private fun findBestUnderlyingNetwork(cm: ConnectivityManager, exclude: Network? = null): Network? {
+    val active = cm.activeNetwork
+    if (active != null && active != exclude) {
+      val caps = runCatching { cm.getNetworkCapabilities(active) }.getOrNull()
+      if (caps != null &&
+        caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN) &&
+        caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+      ) {
+        return active
+      }
+    }
+    @Suppress("DEPRECATION")
+    val candidates = runCatching { cm.allNetworks }.getOrNull().orEmpty()
+    var bestFallback: Network? = null
+    for (net in candidates) {
+      if (net == exclude) continue
+      val caps = runCatching { cm.getNetworkCapabilities(net) }.getOrNull() ?: continue
+      if (!caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)) continue
+      if (!caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)) continue
+      if (caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)) {
+        return net
+      }
+      if (bestFallback == null) bestFallback = net
+    }
+    return bestFallback
+  }
+
+  private fun updateServiceUnderlyingNetworks(network: Network?) {
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP_MR1) {
+      runCatching {
+        setUnderlyingNetworks(if (network != null) arrayOf(network) else null)
+      }
+    }
+  }
+
   private fun prewarmWorkerTls(
     client: OkHttpClient,
     parsedUrl: ParsedWorkerUrl,
@@ -315,8 +445,7 @@ class WorkerVpnService : VpnService() {
   }
 
   private fun establishTunInterface(
-    dnsServer: String,
-    bypassLan: Boolean,
+    settings: AppSettings,
     mtu: Int,
   ): ParcelFileDescriptor? {
     val builder =
@@ -325,13 +454,19 @@ class WorkerVpnService : VpnService() {
         .setMtu(mtu.coerceIn(1280, 1460))
         .addAddress("10.0.0.2", 32)
         .addRoute("0.0.0.0", 0)
-        .addDnsServer(dnsServer.ifBlank { "1.1.1.1" })
+        .addDnsServer(settings.dnsServer.ifBlank { "1.1.1.1" })
 
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
       builder.setMetered(false)
     }
 
-    if (bypassLan && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP_MR1) {
+      underlyingNetwork?.let { net ->
+        runCatching { builder.setUnderlyingNetworks(arrayOf(net)) }
+      }
+    }
+
+    if (settings.bypassLan && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
       runCatching {
         builder.excludeRoute(IpPrefix(InetAddress.getByName("10.0.0.0"), 8))
         builder.excludeRoute(IpPrefix(InetAddress.getByName("172.16.0.0"), 12))
@@ -339,8 +474,33 @@ class WorkerVpnService : VpnService() {
       }
     }
 
-    runCatching {
-      builder.addDisallowedApplication(packageName)
+    // Never mix addAllowedApplication and addDisallowedApplication on the same Builder.
+    // Self-app (CloudNG) is ALWAYS excluded from the VPN tunnel so it connects directly via Wi-Fi/Cellular.
+    val selectedPackages =
+      settings.perAppPackages
+        .asSequence()
+        .map { it.trim() }
+        .filter { it.isNotEmpty() && it != packageName }
+        .toSet()
+
+    if (settings.perAppMode == PerAppProxyMode.ALLOW_ONLY && selectedPackages.isNotEmpty()) {
+      var addedCount = 0
+      for (pkg in selectedPackages) {
+        if (runCatching { builder.addAllowedApplication(pkg) }.isSuccess) {
+          addedCount++
+        }
+      }
+      if (addedCount == 0) {
+        // Fallback if none of the saved packages exist on device
+        runCatching { builder.addDisallowedApplication(packageName) }
+      }
+    } else {
+      runCatching { builder.addDisallowedApplication(packageName) }
+      if (settings.perAppMode == PerAppProxyMode.BYPASS) {
+        for (pkg in selectedPackages) {
+          runCatching { builder.addDisallowedApplication(pkg) }
+        }
+      }
     }
 
     return builder.establish()
@@ -349,7 +509,11 @@ class WorkerVpnService : VpnService() {
   private fun createProtectedSocketFactory(): SocketFactory {
     val defaultFactory = SocketFactory.getDefault()
     fun configure(socket: Socket): Socket {
+      // Protect fd from VPN routing AND bind directly onto the unprotected Wi-Fi/Cellular network
       protect(socket)
+      underlyingNetwork?.let { net ->
+        runCatching { net.bindSocket(socket) }
+      }
       runCatching { socket.tcpNoDelay = true }
       return socket
     }
@@ -385,6 +549,7 @@ class WorkerVpnService : VpnService() {
   }
 
   private fun stopTunnel() {
+    tunnelActive = false
     cleanupEngine()
     stateRepo.updateStatus(VpnStatus.Disconnected)
     stateRepo.log(LogLevel.INFO, "VPN", "Tunnel stopped")
@@ -398,6 +563,12 @@ class WorkerVpnService : VpnService() {
   }
 
   private fun cleanupEngine() {
+    underlyingCallback?.let { cb ->
+      runCatching { connectivityManager?.unregisterNetworkCallback(cb) }
+    }
+    underlyingCallback = null
+    underlyingNetwork = null
+
     serviceScope?.cancel()
     serviceScope = null
     tcpManager?.shutdown()

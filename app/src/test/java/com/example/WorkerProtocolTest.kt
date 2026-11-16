@@ -162,4 +162,25 @@ class WorkerProtocolTest {
     WorkerProtocol.xorInPlace(copy, key)
     assertArrayEquals(input, copy)
   }
+
+  @Test
+  fun `tcp syn-ack window scale option roundtrips cleanly`() {
+    val pkt =
+      Ipv4Packet.buildTcpPacket(
+        srcIp = 0x01010101,
+        dstIp = 0x0A000002,
+        srcPort = 443,
+        dstPort = 54321,
+        seq = 1000L,
+        ack = 2001L,
+        flags = Ipv4Packet.TCP_SYN or Ipv4Packet.TCP_ACK,
+        window = 16384,
+        mss = 1360,
+        windowScale = 7,
+      )
+    val parsed = Ipv4Packet.parse(pkt, pkt.size)
+    assertNotNull(parsed)
+    assertEquals(16384, parsed!!.tcpWindow)
+    assertEquals(7, Ipv4Packet.parseTcpWindowScale(pkt, parsed))
+  }
 }

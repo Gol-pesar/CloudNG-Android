@@ -7,13 +7,13 @@ import com.example.protocol.WorkerProtocol
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.async
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.ConnectionPool
 import okhttp3.Dispatcher
+import okhttp3.Dns
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -24,6 +24,7 @@ import okhttp3.WebSocketListener
 import okio.ByteString
 import okio.ByteString.Companion.toByteString
 import java.io.ByteArrayOutputStream
+import java.net.InetAddress
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
@@ -38,6 +39,7 @@ class DnsHandler(
   private val cleanIp: ParsedCleanIp?,
   private val dnsServerIp: String,
   private val protectedSocketFactory: SocketFactory,
+  private val underlyingDnsLookup: (String) -> List<InetAddress>,
   private val sharedWorkerClient: OkHttpClient,
   private val vpnStateRepository: VpnStateRepository,
   private val writeToTun: (ByteArray) -> Unit,
@@ -45,7 +47,6 @@ class DnsHandler(
   private val reverseIpToDomain = ConcurrentHashMap<String, String>()
   private val queryCache = ConcurrentHashMap<String, Pair<ByteArray, Long>>()
   private val inFlightDedup = ConcurrentHashMap<String, CompletableDeferred<ByteArray?>>()
-  @Volatile private var workerTcpDnsDisabled = false
 
   private val dohClient: OkHttpClient by lazy {
     val dispatcher =
@@ -57,14 +58,23 @@ class DnsHandler(
       .dispatcher(dispatcher)
       .connectionPool(ConnectionPool(6, 120, TimeUnit.SECONDS))
       .socketFactory(protectedSocketFactory)
-      .connectTimeout(1500, TimeUnit.MILLISECONDS)
-      .readTimeout(2500, TimeUnit.MILLISECONDS)
+      .dns(
+        object : Dns {
+          override fun lookup(hostname: String): List<InetAddress> {
+            val resolved = runCatching { underlyingDnsLookup(hostname) }.getOrNull()
+            return if (!resolved.isNullOrEmpty()) resolved else Dns.SYSTEM.lookup(hostname)
+          }
+        }
+      )
+      .connectTimeout(1200, TimeUnit.MILLISECONDS)
+      .readTimeout(1800, TimeUnit.MILLISECONDS)
       .build()
   }
 
   /**
    * Keeps 1 warm, persistent WebSocket tunnel open to `dnsServerIp:53` for pipelined
-   * DNS-over-TCP queries (RFC 7766) — eliminates TLS+WS handshake per DNS lookup (~25ms RTT).
+   * DNS-over-TCP queries (RFC 7766), awaiting handshake readiness instead of spawning
+   * redundant cold WebSocket connections during startup bursts.
    */
   private inner class PersistentDnsTunnel {
     private val lock = Any()
@@ -75,18 +85,22 @@ class DnsHandler(
     private var key = ByteArray(0)
     @Volatile private var acked = false
     @Volatile private var connecting = false
+    @Volatile private var ackReady: CompletableDeferred<Boolean>? = null
     private val lastConnectAttemptMs = AtomicLong(0L)
 
-    fun ensureConnected() {
-      if (workerTcpDnsDisabled) return
+    fun ensureConnected(forceNow: Boolean = false): CompletableDeferred<Boolean>? {
+      val readySignal: CompletableDeferred<Boolean>
       synchronized(lock) {
-        if (ws != null || connecting) return
+        if (acked && ws != null) return CompletableDeferred(true)
+        if (connecting && ackReady != null) return ackReady
         val now = System.currentTimeMillis()
-        if (now - lastConnectAttemptMs.get() < 2_000L) return
+        if (!forceNow && now - lastConnectAttemptMs.get() < 1_000L) return ackReady
         lastConnectAttemptMs.set(now)
         connecting = true
         acked = false
         rxStream.reset()
+        readySignal = CompletableDeferred()
+        ackReady = readySignal
       }
 
       val request = WorkerProtocol.buildWebSocketRequest(parsedWorkerUrl, cleanIp)
@@ -114,7 +128,9 @@ class DnsHandler(
               if (!acked) {
                 if (WorkerProtocol.verifyAck(data, key)) {
                   acked = true
+                  ackReady?.complete(true)
                 } else {
+                  ackReady?.complete(false)
                   reset(webSocket)
                 }
                 return
@@ -152,14 +168,17 @@ class DnsHandler(
             }
 
             override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+              ackReady?.complete(false)
               reset(webSocket)
             }
 
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+              ackReady?.complete(false)
               reset(webSocket)
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+              ackReady?.complete(false)
               reset(webSocket)
             }
           },
@@ -169,20 +188,20 @@ class DnsHandler(
           ws = newWs
         }
       }
+      return readySignal
     }
 
     suspend fun query(dnsQuery: ByteArray): ByteArray? {
-      if (!acked) {
-        ensureConnected()
-        return null
+      if (!acked || ws == null) {
+        val ready = ensureConnected(forceNow = true)
+        val ok = ready?.let { withTimeoutOrNull(1_500L) { it.await() } } ?: false
+        if (!ok || !acked) return null
       }
+
       val activeWs: WebSocket
       val activeKey: ByteArray
       synchronized(lock) {
-        if (!acked || ws == null) {
-          ensureConnected()
-          return null
-        }
+        if (!acked || ws == null) return null
         activeWs = ws!!
         activeKey = key
       }
@@ -207,7 +226,7 @@ class DnsHandler(
         return null
       }
 
-      val resp = withTimeoutOrNull(1_200L) { deferred.await() }
+      val resp = withTimeoutOrNull(1_500L) { deferred.await() }
       pending.remove(internalId)
       if (resp == null || resp.size < 12) return null
       resp[0] = origId0
@@ -222,6 +241,8 @@ class DnsHandler(
         ws = null
         acked = false
         connecting = false
+        ackReady?.complete(false)
+        ackReady = null
         rxStream.reset()
       }
       pending.values.forEach { it.complete(null) }
@@ -237,7 +258,7 @@ class DnsHandler(
 
   init {
     scope.launch(Dispatchers.IO) {
-      persistentTunnel.ensureConnected()
+      persistentTunnel.ensureConnected(forceNow = true)
     }
   }
 
@@ -296,7 +317,7 @@ class DnsHandler(
             try {
               val ans =
                 persistentTunnel.query(dnsQuery)
-                  ?: (if (!workerTcpDnsDisabled) resolveViaWorkerTcp(dnsQuery) else null)
+                  ?: resolveViaWorkerTcp(dnsQuery)
                   ?: resolveViaProtectedDoh(dnsQuery)
               if (ans != null && ans.size >= 12) {
                 queryCache[cacheKey] = ans to (System.currentTimeMillis() + 300_000L)
@@ -304,7 +325,7 @@ class DnsHandler(
               }
               mine.complete(ans)
               ans
-            } catch (t: Throwable) {
+            } catch (_: Throwable) {
               mine.complete(null)
               null
             } finally {
@@ -405,7 +426,6 @@ class DnsHandler(
                 }
 
                 override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                  workerTcpDnsDisabled = true
                   if (cont.isActive) cont.resume(null)
                 }
 

@@ -16,15 +16,18 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.Apps
 import androidx.compose.material.icons.rounded.ContentCopy
 import androidx.compose.material.icons.rounded.DeleteSweep
 import androidx.compose.material.icons.rounded.Terminal
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.FilterChip
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.SegmentedButton
 import androidx.compose.material3.SegmentedButtonDefaults
 import androidx.compose.material3.SingleChoiceSegmentedButtonRow
@@ -61,6 +64,7 @@ fun LogsSettingsScreen(
   onLanguageChange: (AppLanguage) -> Unit,
   onDnsChange: (String) -> Unit,
   onBypassLanChange: (Boolean) -> Unit,
+  onOpenPerAppProxy: () -> Unit,
   onThemeChange: (DarkThemeMode) -> Unit,
   onClearLogs: () -> Unit,
   onShowMessage: (String) -> Unit,
@@ -169,6 +173,45 @@ fun LogsSettingsScreen(
               onCheckedChange = onBypassLanChange,
               modifier = Modifier.testTag("bypass_lan_switch"),
             )
+          }
+
+          HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+
+          // Per-App Proxy
+          Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+          ) {
+            Column(modifier = Modifier.weight(1f).padding(end = 12.dp)) {
+              Text(
+                text = strings.perAppProxyTitle,
+                style = MaterialTheme.typography.bodyLarge,
+                color = MaterialTheme.colorScheme.onSurface,
+              )
+              Text(
+                text = strings.perAppSummary(settings.perAppMode, settings.perAppPackages.size),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.primary,
+              )
+              Text(
+                text = strings.perAppProxyDesc,
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+              )
+            }
+            OutlinedButton(
+              onClick = onOpenPerAppProxy,
+              modifier = Modifier.minimumInteractiveComponentSize().testTag("open_per_app_settings_button"),
+            ) {
+              Icon(
+                imageVector = Icons.Rounded.Apps,
+                contentDescription = null,
+                modifier = Modifier.size(16.dp),
+              )
+              Spacer(modifier = Modifier.width(6.dp))
+              Text(strings.perAppManageButton)
+            }
           }
 
           // Theme

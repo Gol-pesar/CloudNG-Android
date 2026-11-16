@@ -6,10 +6,12 @@ import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.stringPreferencesKey
+import androidx.datastore.preferences.core.stringSetPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import com.example.model.AppLanguage
 import com.example.model.AppSettings
 import com.example.model.DarkThemeMode
+import com.example.model.PerAppProxyMode
 import com.example.model.VpnConfig
 import com.example.protocol.WorkerProtocol
 import kotlinx.coroutines.flow.Flow
@@ -31,6 +33,8 @@ class ConfigRepository(private val context: Context) {
     val DNS_SERVER = stringPreferencesKey("dns_server")
     val BYPASS_LAN = booleanPreferencesKey("bypass_lan")
     val THEME_MODE = stringPreferencesKey("theme_mode")
+    val PER_APP_MODE = stringPreferencesKey("per_app_mode")
+    val PER_APP_PACKAGES = stringSetPreferencesKey("per_app_packages")
   }
 
   val profilesFlow: Flow<List<VpnConfig>> =
@@ -60,11 +64,16 @@ class ConfigRepository(private val context: Context) {
       val lang = AppLanguage.entries.firstOrNull { it.code == langCode } ?: AppLanguage.FA
       val themeKey = prefs[Keys.THEME_MODE] ?: DarkThemeMode.LIGHT.key
       val theme = DarkThemeMode.entries.firstOrNull { it.key == themeKey } ?: DarkThemeMode.LIGHT
+      val perAppKey = prefs[Keys.PER_APP_MODE] ?: PerAppProxyMode.ALL.key
+      val perAppMode = PerAppProxyMode.entries.firstOrNull { it.key == perAppKey } ?: PerAppProxyMode.ALL
+      val perAppPackages = prefs[Keys.PER_APP_PACKAGES] ?: emptySet()
       AppSettings(
         language = lang,
         dnsServer = prefs[Keys.DNS_SERVER] ?: "1.1.1.1",
         bypassLan = prefs[Keys.BYPASS_LAN] ?: true,
         themeMode = theme,
+        perAppMode = perAppMode,
+        perAppPackages = perAppPackages,
       )
     }
 
@@ -199,6 +208,13 @@ class ConfigRepository(private val context: Context) {
 
   suspend fun setThemeMode(mode: DarkThemeMode) {
     context.dataStore.edit { it[Keys.THEME_MODE] = mode.key }
+  }
+
+  suspend fun setPerAppProxy(mode: PerAppProxyMode, packages: Set<String>) {
+    context.dataStore.edit { prefs ->
+      prefs[Keys.PER_APP_MODE] = mode.key
+      prefs[Keys.PER_APP_PACKAGES] = packages
+    }
   }
 
   fun exportShareUri(config: VpnConfig): String {

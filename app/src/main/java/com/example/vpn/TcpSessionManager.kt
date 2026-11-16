@@ -33,9 +33,11 @@ class TcpSessionManager(
 ) {
   companion object {
     private const val MSS = 1360
+    private const val SERVER_WINDOW_SCALE = 7 // 128x multiplier -> 16384 * 128 = 2 MB window
+    private const val SCALED_ACK_WINDOW = 16384
     private const val SESSION_IDLE_MS = 120_000L
     private const val WS_BACKPRESSURE_LIMIT_BYTES = 2 * 1024 * 1024L
-    private const val MAX_OOO_SEGMENTS = 16
+    private const val MAX_OOO_SEGMENTS = 24
   }
 
   data class TcpKey(
@@ -55,6 +57,7 @@ class TcpSessionManager(
     val key: TcpKey,
     val targetHost: String,
     initialClientSeq: Long,
+    private val negotiateWindowScale: Boolean,
   ) {
     val createdAtMs = System.currentTimeMillis()
     @Volatile var lastActivityMs = createdAtMs
@@ -66,6 +69,7 @@ class TcpSessionManager(
     @Volatile var initSent = false
     @Volatile var ackVerified = false
     @Volatile var clientFinReceived = false
+    private var unackedClientBytes = 0
     private val pendingPreOpen = ByteArrayOutputStream()
     private val oooBuffer = TreeMap<Long, ByteArray>()
     private val sessionLock = Any()
@@ -74,8 +78,17 @@ class TcpSessionManager(
       lastActivityMs = System.currentTimeMillis()
     }
 
+    private fun currentAdvertisedWindow(activeWs: WebSocket?): Int {
+      val congested = activeWs != null && activeWs.queueSize() > WS_BACKPRESSURE_LIMIT_BYTES
+      return if (negotiateWindowScale) {
+        if (congested) 64 else SCALED_ACK_WINDOW
+      } else {
+        if (congested) 4096 else 65535
+      }
+    }
+
     /**
-     * 0-RTT Optimistic Handshake with strict ordered framing and zero-copy XOR.
+     * 0-RTT Optimistic Handshake with RFC 1323 Window Scaling and zero-copy XOR.
      */
     fun startTunnelOptimistic() {
       sendSynAck()
@@ -182,30 +195,46 @@ class TcpSessionManager(
       if (parsed.payloadLength > 0) {
         val expected = clientNextSeq
         if (parsed.tcpSeq == expected) {
-          val payload = raw.copyOfRange(parsed.payloadOffset, parsed.payloadOffset + parsed.payloadLength)
-          processInOrderPayload(payload)
+          val firstPayload =
+            raw.copyOfRange(parsed.payloadOffset, parsed.payloadOffset + parsed.payloadLength)
 
-          // Drain any contiguous out-of-order segments now unblocked
-          while (oooBuffer.isNotEmpty()) {
-            val next = oooBuffer.remove(clientNextSeq) ?: break
-            processInOrderPayload(next)
-          }
+          // Coalesce contiguous out-of-order segments into a single WebSocket binary frame
+          val combined =
+            if (oooBuffer.isEmpty()) {
+              firstPayload
+            } else {
+              val batch = ByteArrayOutputStream(firstPayload.size * 2)
+              batch.write(firstPayload)
+              var nextExpected = (expected + firstPayload.size) and 0xFFFFFFFFL
+              while (true) {
+                val seg = oooBuffer.remove(nextExpected) ?: break
+                batch.write(seg)
+                nextExpected = (nextExpected + seg.size) and 0xFFFFFFFFL
+              }
+              batch.toByteArray()
+            }
 
+          processInOrderPayload(combined)
+          unackedClientBytes += combined.size
+
+          val hasPsh = (flags and Ipv4Packet.TCP_PSH) != 0
           val activeWs = ws
-          val window =
-            if (activeWs != null && activeWs.queueSize() > WS_BACKPRESSURE_LIMIT_BYTES) 4096
-            else 65535
-          sendAck(window)
+          val congested = activeWs != null && activeWs.queueSize() > WS_BACKPRESSURE_LIMIT_BYTES
+          if (hasPsh || congested || unackedClientBytes >= MSS * 2) {
+            unackedClientBytes = 0
+            sendAck(currentAdvertisedWindow(activeWs))
+          }
         } else if (isSeqAfter(parsed.tcpSeq, expected)) {
           val gap = (parsed.tcpSeq - expected) and 0xFFFFFFFFL
-          if (gap <= 65535L && oooBuffer.size < MAX_OOO_SEGMENTS && !oooBuffer.containsKey(parsed.tcpSeq)) {
+          if (gap <= 262_144L && oooBuffer.size < MAX_OOO_SEGMENTS && !oooBuffer.containsKey(parsed.tcpSeq)) {
             oooBuffer[parsed.tcpSeq] =
               raw.copyOfRange(parsed.payloadOffset, parsed.payloadOffset + parsed.payloadLength)
           }
-          // Immediate DupACK triggers TCP Fast Retransmit without waiting for RTO
-          sendAck(65535)
+          unackedClientBytes = 0
+          sendAck(currentAdvertisedWindow(ws))
         } else if (isSeqBefore(parsed.tcpSeq, expected)) {
-          sendAck(65535)
+          unackedClientBytes = 0
+          sendAck(currentAdvertisedWindow(ws))
         }
       }
 
@@ -214,7 +243,8 @@ class TcpSessionManager(
         if (finSeq == clientNextSeq) {
           clientNextSeq = (finSeq + 1L) and 0xFFFFFFFFL
           clientFinReceived = true
-          sendAck(65535)
+          unackedClientBytes = 0
+          sendAck(currentAdvertisedWindow(ws))
         }
       }
     }
@@ -248,6 +278,7 @@ class TcpSessionManager(
             flags = Ipv4Packet.TCP_SYN or Ipv4Packet.TCP_ACK,
             window = 65535,
             mss = MSS,
+            windowScale = if (negotiateWindowScale) SERVER_WINDOW_SCALE else null,
           )
         serverSeq = (serverSeq + 1L) and 0xFFFFFFFFL
         writeToTun(pkt)
@@ -275,6 +306,7 @@ class TcpSessionManager(
     private fun sendDataChunksToTun(data: ByteArray) {
       synchronized(sessionLock) {
         if (state == State.CLOSED) return
+        val wnd = currentAdvertisedWindow(ws)
         var off = 0
         while (off < data.size) {
           val chunkLen = (data.size - off).coerceAtMost(MSS)
@@ -291,7 +323,7 @@ class TcpSessionManager(
               seq = serverSeq,
               ack = clientNextSeq,
               flags = flags,
-              window = 65535,
+              window = wnd,
               payload = data,
               payloadOffset = off,
               payloadLength = chunkLen,
@@ -315,6 +347,7 @@ class TcpSessionManager(
             seq = serverSeq,
             ack = clientNextSeq,
             flags = Ipv4Packet.TCP_FIN or Ipv4Packet.TCP_ACK,
+            window = currentAdvertisedWindow(ws),
           )
         serverSeq = (serverSeq + 1L) and 0xFFFFFFFFL
         writeToTun(pkt)
@@ -380,9 +413,12 @@ class TcpSessionManager(
       sessions.remove(key)?.closeInternal()
       val dstStr = parsed.dstIpString
       val targetHost = dnsHandler.lookupDomainForIp(dstStr) ?: dstStr
-      val session = TcpSession(key, targetHost, parsed.tcpSeq)
+      val clientWs = Ipv4Packet.parseTcpWindowScale(raw, parsed)
+      val session = TcpSession(key, targetHost, parsed.tcpSeq, negotiateWindowScale = clientWs != null)
       sessions[key] = session
-      vpnStateRepository.log(LogLevel.TRAFFIC, "TUN", "0-RTT dial → $targetHost:${parsed.dstPort}")
+      if (vpnStateRepository.wantsTrafficLog()) {
+        vpnStateRepository.log(LogLevel.TRAFFIC, "TUN", "0-RTT dial → $targetHost:${parsed.dstPort}")
+      }
       session.startTunnelOptimistic()
       return
     }

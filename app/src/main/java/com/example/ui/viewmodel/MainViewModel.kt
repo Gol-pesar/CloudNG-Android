@@ -1,5 +1,9 @@
 package com.example.ui.viewmodel
 
+import android.content.Context
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.os.Build
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
@@ -9,12 +13,15 @@ import com.example.model.AppSettings
 import com.example.model.CleanIpTestResult
 import com.example.model.DarkThemeMode
 import com.example.model.HandshakeTestResult
+import com.example.model.InstalledAppInfo
 import com.example.model.LogEntry
 import com.example.model.LogLevel
+import com.example.model.PerAppProxyMode
 import com.example.model.VpnConfig
 import com.example.model.VpnStatus
 import com.example.model.VpnTelemetry
 import com.example.protocol.WorkerProtocol
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.delay
@@ -26,6 +33,7 @@ import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.util.UUID
 
 data class DraftFieldsState(
@@ -77,6 +85,12 @@ class MainViewModel(
 
   private val _elapsedSeconds = MutableStateFlow(0L)
   val elapsedSeconds: StateFlow<Long> = _elapsedSeconds.asStateFlow()
+
+  private val _installedApps = MutableStateFlow<List<InstalledAppInfo>>(emptyList())
+  val installedApps: StateFlow<List<InstalledAppInfo>> = _installedApps.asStateFlow()
+
+  private val _isLoadingApps = MutableStateFlow(false)
+  val isLoadingApps: StateFlow<Boolean> = _isLoadingApps.asStateFlow()
 
   private val defaultCleanIps =
     listOf(
@@ -135,6 +149,65 @@ class MainViewModel(
           _elapsedSeconds.value = 0L
         }
       }
+    }
+  }
+
+  fun loadInstalledApps(context: Context) {
+    if (_isLoadingApps.value) return
+    val selfPackage = context.packageName
+    viewModelScope.launch {
+      _isLoadingApps.value = true
+      val apps =
+        withContext(Dispatchers.IO) {
+          runCatching {
+            val pm = context.packageManager
+            val launcherIntent =
+              Intent(Intent.ACTION_MAIN).apply {
+                addCategory(Intent.CATEGORY_LAUNCHER)
+              }
+            val resolveInfos =
+              if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                pm.queryIntentActivities(
+                  launcherIntent,
+                  PackageManager.ResolveInfoFlags.of(0L),
+                )
+              } else {
+                @Suppress("DEPRECATION")
+                pm.queryIntentActivities(launcherIntent, 0)
+              }
+
+            val uniqueByPackage = LinkedHashMap<String, InstalledAppInfo>()
+            for (info in resolveInfos) {
+              val pkg = info.activityInfo?.packageName ?: continue
+              if (pkg == selfPackage || uniqueByPackage.containsKey(pkg)) continue
+              val label =
+                runCatching { info.loadLabel(pm).toString() }
+                  .getOrNull()
+                  ?.takeIf { it.isNotBlank() }
+                  ?: pkg
+              uniqueByPackage[pkg] = InstalledAppInfo(packageName = pkg, label = label)
+            }
+            uniqueByPackage.values.sortedBy { it.label.lowercase() }
+          }.getOrDefault(emptyList())
+        }
+      _installedApps.value = apps
+      _isLoadingApps.value = false
+    }
+  }
+
+  fun setPerAppProxy(
+    mode: PerAppProxyMode,
+    packages: Set<String>,
+    onSaved: (() -> Unit)? = null,
+  ) {
+    viewModelScope.launch {
+      configRepo.setPerAppProxy(mode, packages)
+      stateRepo.log(
+        LogLevel.INFO,
+        "PERAPP",
+        "Per-App Proxy updated → mode=${mode.key}, selected=${packages.size}",
+      )
+      onSaved?.invoke()
     }
   }
 

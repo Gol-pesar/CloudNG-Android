@@ -13,6 +13,17 @@ enum class DarkThemeMode(val key: String) {
   LIGHT("light"),
 }
 
+enum class PerAppProxyMode(val key: String) {
+  ALL("all"),
+  BYPASS("bypass"),
+  ALLOW_ONLY("allow_only"),
+}
+
+data class InstalledAppInfo(
+  val packageName: String,
+  val label: String,
+)
+
 data class VpnConfig(
   val id: String = UUID.randomUUID().toString(),
   val name: String = "CloudNG Node",
@@ -70,6 +81,8 @@ data class AppSettings(
   val dnsServer: String = "1.1.1.1",
   val bypassLan: Boolean = true,
   val themeMode: DarkThemeMode = DarkThemeMode.LIGHT,
+  val perAppMode: PerAppProxyMode = PerAppProxyMode.ALL,
+  val perAppPackages: Set<String> = emptySet(),
 )
 
 data class HandshakeTestResult(

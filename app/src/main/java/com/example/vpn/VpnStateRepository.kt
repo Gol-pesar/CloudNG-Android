@@ -69,6 +69,8 @@ class VpnStateRepository {
     _telemetry.update { it.copy(handshakeRttMs = rttMs) }
   }
 
+  fun wantsTrafficLog(): Boolean = System.currentTimeMillis() - lastTrafficLogMs >= 400L
+
   fun log(level: LogLevel, tag: String, message: String) {
     val now = System.currentTimeMillis()
     if (level == LogLevel.TRAFFIC) {

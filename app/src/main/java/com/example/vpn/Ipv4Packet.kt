@@ -142,6 +142,29 @@ object Ipv4Packet {
     return pkt
   }
 
+  fun parseTcpWindowScale(buf: ByteArray, parsed: ParsedPacket): Int? {
+    if (parsed.protocol != PROTO_TCP) return null
+    val optStart = parsed.ipHeaderLen + 20
+    val optEnd = parsed.payloadOffset
+    var i = optStart
+    while (i < optEnd) {
+      val kind = buf[i].toInt() and 0xFF
+      if (kind == 0) break // End of options
+      if (kind == 1) {
+        i++
+        continue
+      }
+      if (i + 1 >= optEnd) break
+      val len = buf[i + 1].toInt() and 0xFF
+      if (len < 2 || i + len > optEnd) break
+      if (kind == 3 && len == 3 && i + 2 < optEnd) {
+        return (buf[i + 2].toInt() and 0xFF).coerceIn(0, 14)
+      }
+      i += len
+    }
+    return null
+  }
+
   fun buildTcpPacket(
     srcIp: Int,
     dstIp: Int,
@@ -155,9 +178,12 @@ object Ipv4Packet {
     payloadOffset: Int = 0,
     payloadLength: Int = payload.size,
     mss: Int? = null,
+    windowScale: Int? = null,
     ipId: Int = 0,
   ): ByteArray {
-    val optionsLen = if (mss != null) 4 else 0
+    val mssLen = if (mss != null) 4 else 0
+    val wsLen = if (windowScale != null) 4 else 0
+    val optionsLen = mssLen + wsLen
     val tcpHeaderLen = 20 + optionsLen
     val tcpLen = tcpHeaderLen + payloadLength
     val totalLen = 20 + tcpLen
@@ -175,10 +201,18 @@ object Ipv4Packet {
     writeU16(pkt, 36, 0) // checksum
     writeU16(pkt, 38, 0) // urgent
 
+    var optOff = 40
     if (mss != null) {
-      pkt[40] = 0x02
-      pkt[41] = 0x04
-      writeU16(pkt, 42, mss)
+      pkt[optOff++] = 0x02
+      pkt[optOff++] = 0x04
+      writeU16(pkt, optOff, mss)
+      optOff += 2
+    }
+    if (windowScale != null) {
+      pkt[optOff++] = 0x01 // NOP
+      pkt[optOff++] = 0x03 // Window Scale kind
+      pkt[optOff++] = 0x03 // Length
+      pkt[optOff] = windowScale.coerceIn(0, 14).toByte()
     }
 
     if (payloadLength > 0) {
