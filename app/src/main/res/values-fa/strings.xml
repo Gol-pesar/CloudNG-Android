@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">CloudNG</string>
+    <string name="vpn_channel_name">وضعیت اتصال VPN</string>
+    <string name="vpn_channel_desc">نمایش وضعیت اتصال فعال CloudNG و آمار ترافیک</string>
+    <string name="vpn_notif_connected_title">CloudNG متصل است</string>
+    <string name="vpn_notif_connecting_title">در حال اتصال به ورکر…</string>
+    <string name="vpn_notif_disconnect">قطع اتصال</string>
+    <string name="nav_connect">اتصال</string>
+    <string name="nav_profiles">مدیریت کانفیگ</string>
+    <string name="nav_logs">گزارش و تنظیمات</string>
+</resources>

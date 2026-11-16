@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">CloudNG</string>
+    <string name="vpn_channel_name">VPN Connection</string>
+    <string name="vpn_channel_desc">Shows active CloudNG VPN connection status and traffic stats</string>
+    <string name="vpn_notif_connected_title">CloudNG Connected</string>
+    <string name="vpn_notif_connecting_title">Connecting to Worker…</string>
+    <string name="vpn_notif_disconnect">Disconnect</string>
+    <string name="nav_connect">Connect</string>
+    <string name="nav_profiles">Configs &amp; IPs</string>
+    <string name="nav_logs">Logs &amp; Settings</string>
+</resources>
