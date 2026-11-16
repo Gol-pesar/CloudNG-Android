@@ -203,4 +203,45 @@ class WorkerProtocolTest {
     WorkerProtocol.xorInPlace(dec, key16)
     assertArrayEquals(data, dec)
   }
+
+  @Test
+  fun `clean ip request replaces URL host without changing Host header`() {
+    val parsedUrl =
+      WorkerProtocol.parseWorkerUrl("wss://twilight-dream-9e3c.aliahmadiphotoofficial.workers.dev/")!!
+    val cleanIpv4 = WorkerProtocol.parseCleanIp("172.67.70.244")!!
+    val wsReq = WorkerProtocol.buildWebSocketRequest(parsedUrl, cleanIpv4)
+    assertEquals("172.67.70.244", wsReq.url.host)
+    assertEquals(443, wsReq.url.port)
+    assertEquals("twilight-dream-9e3c.aliahmadiphotoofficial.workers.dev", wsReq.header("Host"))
+    assertEquals("chat.v2", wsReq.header("Sec-WebSocket-Protocol"))
+    assertEquals("identity", wsReq.header("Accept-Encoding"))
+
+    val cleanIpv6 = WorkerProtocol.parseCleanIp("[2606:4700::1]:8443")!!
+    val wsReqV6 = WorkerProtocol.buildWebSocketRequest(parsedUrl, cleanIpv6)
+    assertEquals("2606:4700::1", wsReqV6.url.host)
+    assertEquals(8443, wsReqV6.url.port)
+    assertEquals("twilight-dream-9e3c.aliahmadiphotoofficial.workers.dev", wsReqV6.header("Host"))
+
+    val warmReq = WorkerProtocol.buildPrewarmRequest(parsedUrl, cleanIpv4)
+    assertEquals("HEAD", warmReq.method)
+    assertEquals("172.67.70.244", warmReq.url.host)
+    assertEquals("twilight-dream-9e3c.aliahmadiphotoofficial.workers.dev", warmReq.header("Host"))
+    assertEquals("identity", warmReq.header("Accept-Encoding"))
+  }
+
+  @Test
+  fun `clean ip client resolves numeric IPv4 literal in memory without DNS`() {
+    val workerHost = "twilight-dream-9e3c.aliahmadiphotoofficial.workers.dev"
+    val cleanIp = WorkerProtocol.parseCleanIp("172.67.70.244")!!
+    val client =
+      WorkerProtocol.createWorkerOkHttpClient(
+        workerHost = workerHost,
+        cleanIp = cleanIp,
+        fallbackDnsLookup = { throw AssertionError("Network DNS must not be called for Clean IP") },
+      )
+    val resolved = client.dns.lookup("172.67.70.244")
+    assertEquals(1, resolved.size)
+    assertEquals("172.67.70.244", resolved.first().hostAddress)
+    assertEquals(0, client.pingIntervalMillis)
+  }
 }

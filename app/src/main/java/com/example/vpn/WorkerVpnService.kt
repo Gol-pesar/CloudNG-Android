@@ -36,9 +36,7 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import okhttp3.ConnectionPool
 import okhttp3.OkHttpClient
-import okhttp3.Request
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.net.InetAddress
@@ -432,14 +430,7 @@ class WorkerVpnService : VpnService() {
     logResult: Boolean = false,
   ) {
     val start = System.currentTimeMillis()
-    val effectivePort = cleanIp?.port ?: parsedUrl.port
-    val defaultPort = if (parsedUrl.isTls) 443 else 80
-    val portSuffix = if (effectivePort != defaultPort) ":$effectivePort" else ""
-    val req =
-      Request.Builder()
-        .url("${parsedUrl.httpScheme}://${parsedUrl.host}$portSuffix/")
-        .head()
-        .build()
+    val req = WorkerProtocol.buildPrewarmRequest(parsedUrl, cleanIp)
     runCatching {
       client.newCall(req).execute().use { resp ->
         if (logResult) {
