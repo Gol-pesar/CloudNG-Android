@@ -453,7 +453,7 @@ private fun TelemetryGrid(
       StatTile(
         label = strings.activeTunnelsLabel,
         value = telemetry.activeConnections.toString(),
-        subValue = "TCP / DoH",
+        subValue = "WSS · TCP",
         icon = Icons.Rounded.Hub,
         accent = MaterialTheme.colorScheme.primary,
         modifier = Modifier.weight(1f),

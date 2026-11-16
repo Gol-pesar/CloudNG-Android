@@ -23,7 +23,6 @@ import androidx.compose.material.icons.rounded.Speed
 import androidx.compose.material.icons.rounded.Terminal
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
-import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -54,7 +53,6 @@ import com.example.model.LogEntry
 import com.example.model.LogLevel
 import com.example.model.RamThreadGuide
 import com.example.ui.strings.LocalAppStrings
-import com.example.ui.theme.JetBrainsMonoFontFamily
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -65,7 +63,6 @@ fun LogsSettingsScreen(
   deviceRamGb: Int,
   logs: List<LogEntry>,
   onLanguageChange: (AppLanguage) -> Unit,
-  onDnsChange: (String) -> Unit,
   onBypassLanChange: (Boolean) -> Unit,
   onOpenPerAppProxy: () -> Unit,
   onOpenWorkerThreads: () -> Unit,
@@ -117,38 +114,6 @@ fun LogsSettingsScreen(
                   modifier = Modifier.testTag("lang_option_${lang.code}"),
                 ) {
                   Text(lang.label)
-                }
-              }
-            }
-          }
-
-          // DNS Server
-          Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-            Text(
-              text = strings.dnsLabel,
-              style = MaterialTheme.typography.labelLarge,
-              color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            val dnsChoices = listOf("1.1.1.1", "8.8.8.8", "9.9.9.9")
-            CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Ltr) {
-              Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-              ) {
-                dnsChoices.forEach { dns ->
-                  FilterChip(
-                    selected = settings.dnsServer == dns,
-                    onClick = { onDnsChange(dns) },
-                    label = {
-                      Text(
-                        text = dns,
-                        style = MaterialTheme.typography.labelMedium.copy(
-                          fontFamily = JetBrainsMonoFontFamily,
-                        ),
-                      )
-                    },
-                    modifier = Modifier.minimumInteractiveComponentSize().testTag("dns_chip_$dns"),
-                  )
                 }
               }
             }

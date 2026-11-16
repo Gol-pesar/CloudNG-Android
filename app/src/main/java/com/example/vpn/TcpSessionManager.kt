@@ -30,7 +30,7 @@ class TcpSessionManager(
   private val uuid: String,
   private val cleanIp: ParsedCleanIp?,
   private val sharedWorkerClient: OkHttpClient,
-  private val dnsHandler: DnsHandler,
+  private val hostMapper: VirtualHostMapper,
   private val vpnStateRepository: VpnStateRepository,
   workerThreads: Int = 8,
   private val writeToTun: (ByteArray) -> Unit,
@@ -452,7 +452,7 @@ class TcpSessionManager(
     if (isSynOnly) {
       sessions.remove(key)?.closeInternal()
       val dstStr = parsed.dstIpString
-      val targetHost = dnsHandler.lookupDomainForIp(dstStr) ?: dstStr
+      val targetHost = hostMapper.lookupDomainForIp(dstStr) ?: dstStr
       val clientWs = Ipv4Packet.parseTcpWindowScale(raw, parsed)
       val session = TcpSession(key, targetHost, parsed.tcpSeq, negotiateWindowScale = clientWs != null)
       sessions[key] = session

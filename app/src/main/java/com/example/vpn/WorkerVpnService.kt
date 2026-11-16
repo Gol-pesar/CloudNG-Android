@@ -87,8 +87,8 @@ class WorkerVpnService : VpnService() {
   private var serviceScope: CoroutineScope? = null
   private var tunInterface: ParcelFileDescriptor? = null
   private var sharedWorkerClient: OkHttpClient? = null
+  private var hostMapper: VirtualHostMapper? = null
   private var tcpManager: TcpSessionManager? = null
-  private var dnsHandler: DnsHandler? = null
   private var connectivityManager: ConnectivityManager? = null
   private var underlyingCallback: ConnectivityManager.NetworkCallback? = null
   @Volatile private var underlyingNetwork: Network? = null
@@ -231,18 +231,8 @@ class WorkerVpnService : VpnService() {
         }
       }
 
-      val dns =
-        DnsHandler(
-          scope = scope,
-          parsedWorkerUrl = parsedUrl,
-          uuid = config.uuid,
-          cleanIp = cleanIp,
-          dnsServerIp = settings.dnsServer.ifBlank { "1.1.1.1" },
-          sharedWorkerClient = workerClient,
-          vpnStateRepository = stateRepo,
-          writeToTun = enqueueToTun,
-        )
-      dnsHandler = dns
+      val mapper = VirtualHostMapper()
+      hostMapper = mapper
 
       val tcp =
         TcpSessionManager(
@@ -251,7 +241,7 @@ class WorkerVpnService : VpnService() {
           uuid = config.uuid,
           cleanIp = cleanIp,
           sharedWorkerClient = workerClient,
-          dnsHandler = dns,
+          hostMapper = mapper,
           vpnStateRepository = stateRepo,
           workerThreads = workerThreads,
           writeToTun = enqueueToTun,
@@ -325,9 +315,9 @@ class WorkerVpnService : VpnService() {
             Ipv4Packet.PROTO_TCP -> tcp.handleTcpPacket(packetBytes, parsed)
             Ipv4Packet.PROTO_UDP -> {
               if (parsed.dstPort == 53) {
-                dns.handleUdpPacket(packetBytes, parsed)
+                mapper.handleQueryPacket(packetBytes, parsed)?.let(enqueueToTun)
               } else {
-                // Force QUIC/HTTP3 (UDP 443) to fall back immediately to TCP 443
+                // Force non-53 UDP (e.g. QUIC) to fall back immediately to TCP
                 enqueueToTun(Ipv4Packet.buildIcmpPortUnreachable(packetBytes, len, parsed))
               }
             }
@@ -455,7 +445,7 @@ class WorkerVpnService : VpnService() {
         .setMtu(mtu.coerceIn(1280, 1460))
         .addAddress("10.0.0.2", 32)
         .addRoute("0.0.0.0", 0)
-        .addDnsServer(settings.dnsServer.ifBlank { "1.1.1.1" })
+        .addDnsServer(VirtualHostMapper.VIRTUAL_TUN_GATEWAY_IP)
 
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
       builder.setMetered(false)
@@ -581,8 +571,8 @@ class WorkerVpnService : VpnService() {
     serviceScope = null
     tcpManager?.shutdown()
     tcpManager = null
-    dnsHandler?.shutdown()
-    dnsHandler = null
+    hostMapper?.clear()
+    hostMapper = null
     sharedWorkerClient?.let { client ->
       runCatching {
         client.dispatcher.executorService.shutdown()

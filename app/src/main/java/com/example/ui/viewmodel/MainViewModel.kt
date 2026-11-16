@@ -482,10 +482,6 @@ class MainViewModel(
     viewModelScope.launch { configRepo.setLanguage(language) }
   }
 
-  fun setDnsServer(dns: String) {
-    viewModelScope.launch { configRepo.setDnsServer(dns) }
-  }
-
   fun setBypassLan(enabled: Boolean) {
     viewModelScope.launch { configRepo.setBypassLan(enabled) }
   }

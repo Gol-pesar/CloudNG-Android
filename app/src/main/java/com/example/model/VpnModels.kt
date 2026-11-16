@@ -30,7 +30,6 @@ data class VpnConfig(
   val workerUrl: String = "",
   val uuid: String = "",
   val cleanIp: String = "",
-  val dnsServer: String = "1.1.1.1",
   val bypassLan: Boolean = true,
   val mtu: Int = 1440,
   val lastPingMs: Long? = null,
@@ -78,7 +77,6 @@ data class LogEntry(
 
 data class AppSettings(
   val language: AppLanguage = AppLanguage.FA,
-  val dnsServer: String = "1.1.1.1",
   val bypassLan: Boolean = true,
   val themeMode: DarkThemeMode = DarkThemeMode.LIGHT,
   val perAppMode: PerAppProxyMode = PerAppProxyMode.ALL,

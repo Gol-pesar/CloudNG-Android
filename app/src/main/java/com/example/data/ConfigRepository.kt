@@ -32,7 +32,6 @@ class ConfigRepository(private val context: Context) {
     val PROFILES_JSON = stringPreferencesKey("profiles_json")
     val ACTIVE_PROFILE_ID = stringPreferencesKey("active_profile_id")
     val LANGUAGE = stringPreferencesKey("language")
-    val DNS_SERVER = stringPreferencesKey("dns_server")
     val BYPASS_LAN = booleanPreferencesKey("bypass_lan")
     val THEME_MODE = stringPreferencesKey("theme_mode")
     val PER_APP_MODE = stringPreferencesKey("per_app_mode")
@@ -77,7 +76,6 @@ class ConfigRepository(private val context: Context) {
         )
       AppSettings(
         language = lang,
-        dnsServer = prefs[Keys.DNS_SERVER] ?: "1.1.1.1",
         bypassLan = prefs[Keys.BYPASS_LAN] ?: true,
         themeMode = theme,
         perAppMode = perAppMode,
@@ -207,10 +205,6 @@ class ConfigRepository(private val context: Context) {
     context.dataStore.edit { it[Keys.LANGUAGE] = language.code }
   }
 
-  suspend fun setDnsServer(dnsServer: String) {
-    context.dataStore.edit { it[Keys.DNS_SERVER] = dnsServer.trim() }
-  }
-
   suspend fun setBypassLan(enabled: Boolean) {
     context.dataStore.edit { it[Keys.BYPASS_LAN] = enabled }
   }
@@ -308,7 +302,6 @@ class ConfigRepository(private val context: Context) {
               workerUrl = obj.optString("workerUrl", ""),
               uuid = obj.optString("uuid", ""),
               cleanIp = obj.optString("cleanIp", ""),
-              dnsServer = obj.optString("dnsServer", "1.1.1.1"),
               bypassLan = obj.optBoolean("bypassLan", true),
               mtu = obj.optInt("mtu", 1400),
               lastPingMs = if (obj.has("lastPingMs") && !obj.isNull("lastPingMs")) obj.getLong("lastPingMs") else null,
@@ -330,7 +323,6 @@ class ConfigRepository(private val context: Context) {
       obj.put("workerUrl", item.workerUrl)
       obj.put("uuid", item.uuid)
       obj.put("cleanIp", item.cleanIp)
-      obj.put("dnsServer", item.dnsServer)
       obj.put("bypassLan", item.bypassLan)
       obj.put("mtu", item.mtu)
       if (item.lastPingMs != null) {

@@ -205,8 +205,8 @@ class WorkerTester(
                     val (initFrame, key) =
                       WorkerProtocol.buildInitPacket(
                         uuid = uuid,
-                        targetHost = "1.1.1.1",
-                        targetPort = 443,
+                        targetHost = "example.com",
+                        targetPort = 80,
                       )
                     sessionKey = key
                     webSocket.send(initFrame.toByteString())

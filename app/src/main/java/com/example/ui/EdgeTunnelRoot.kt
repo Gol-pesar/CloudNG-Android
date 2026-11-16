@@ -464,7 +464,6 @@ fun EdgeTunnelRoot(viewModel: MainViewModel) {
                     deviceRamGb = deviceRamGb,
                     logs = logs,
                     onLanguageChange = viewModel::setLanguage,
-                    onDnsChange = viewModel::setDnsServer,
                     onBypassLanChange = viewModel::setBypassLan,
                     onOpenPerAppProxy = {
                       viewModel.loadInstalledApps(context)

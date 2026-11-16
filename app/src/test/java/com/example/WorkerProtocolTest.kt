@@ -266,4 +266,49 @@ class WorkerProtocolTest {
     assertEquals("104.16.132.229", WorkerProtocol.resolveTargetIp(domainUrl, WorkerProtocol.parseCleanIp("104.16.132.229:443")))
     assertEquals("2606:4700::1", WorkerProtocol.resolveTargetIp(domainUrl, WorkerProtocol.parseCleanIp("[2606:4700::1]:8443")))
   }
+
+  @Test
+  fun `virtual host mapper assigns synthetic RFC2544 IPv4 and maps back to domain without network`() {
+    val mapper = com.example.vpn.VirtualHostMapper()
+    val domain = "api.github.com"
+    // Minimal UDP DNS A query for api.github.com (QTYPE=1, QCLASS=1)
+    val qnameBytes =
+      byteArrayOf(
+        3, 'a'.code.toByte(), 'p'.code.toByte(), 'i'.code.toByte(),
+        6, 'g'.code.toByte(), 'i'.code.toByte(), 't'.code.toByte(), 'h'.code.toByte(), 'u'.code.toByte(), 'b'.code.toByte(),
+        3, 'c'.code.toByte(), 'o'.code.toByte(), 'm'.code.toByte(),
+        0,
+      )
+    val dnsPayload = ByteArray(12 + qnameBytes.size + 4)
+    dnsPayload[0] = 0x12
+    dnsPayload[1] = 0x34
+    dnsPayload[2] = 0x01 // RD=1
+    dnsPayload[5] = 0x01 // QDCOUNT=1
+    System.arraycopy(qnameBytes, 0, dnsPayload, 12, qnameBytes.size)
+    dnsPayload[12 + qnameBytes.size + 1] = 0x01 // QTYPE=A
+    dnsPayload[12 + qnameBytes.size + 3] = 0x01 // QCLASS=IN
+
+    val udpPkt =
+      Ipv4Packet.buildUdpPacket(
+        srcIp = 0x0A000002,
+        dstIp = 0xC6120001.toInt(), // 198.18.0.1
+        srcPort = 54321,
+        dstPort = 53,
+        payload = dnsPayload,
+      )
+    val parsedUdp = Ipv4Packet.parse(udpPkt, udpPkt.size)!!
+    val replyUdp = mapper.handleQueryPacket(udpPkt, parsedUdp)
+    assertNotNull(replyUdp)
+    val parsedReply = Ipv4Packet.parse(replyUdp!!, replyUdp.size)!!
+    assertEquals(53, parsedReply.srcPort)
+    assertEquals(54321, parsedReply.dstPort)
+    val resp = replyUdp.copyOfRange(parsedReply.payloadOffset, parsedReply.payloadOffset + parsedReply.payloadLength)
+    assertEquals(0x12, resp[0].toInt() and 0xFF)
+    assertEquals(0x34, resp[1].toInt() and 0xFF)
+    assertEquals(1, resp[7].toInt() and 0xFF) // ANCOUNT = 1
+
+    val assignedIp = WorkerProtocol.ipv4ToString(resp, resp.size - 4)
+    assertTrue(assignedIp.startsWith("198.18.") || assignedIp.startsWith("198.19."))
+    assertEquals("api.github.com", mapper.lookupDomainForIp(assignedIp))
+  }
 }
