@@ -14,7 +14,6 @@ import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import okio.ByteString
 import okio.ByteString.Companion.toByteString
-import java.net.InetAddress
 import kotlin.coroutines.resume
 
 class WorkerTester(
@@ -35,13 +34,14 @@ class WorkerTester(
       }
 
       val cleanIp = WorkerProtocol.parseCleanIp(config.cleanIp)
+      val targetIp =
+        WorkerProtocol.resolveTargetIp(parsedUrl, cleanIp)
+          ?: return@withContext HandshakeTestResult(
+            success = false,
+            errorMessage = "Clean IP (IPv4/IPv6) is required — DNS is disabled",
+          )
       val startMs = System.currentTimeMillis()
-      val resolvedIpDisplay =
-        try {
-          cleanIp?.host ?: InetAddress.getByName(parsedUrl.host).hostAddress
-        } catch (_: Exception) {
-          cleanIp?.host ?: parsedUrl.host
-        }
+      val resolvedIpDisplay = targetIp
 
       val client = WorkerProtocol.createWorkerOkHttpClient(
         workerHost = parsedUrl.host,
@@ -178,6 +178,9 @@ class WorkerTester(
         ?: return@withContext CleanIpTestResult(ip = candidateIp, error = "Invalid Worker URL")
       val parsedClean = WorkerProtocol.parseCleanIp(candidateIp)
         ?: return@withContext CleanIpTestResult(ip = candidateIp, error = "Invalid IP")
+      if (!WorkerProtocol.isIpLiteral(parsedClean.host)) {
+        return@withContext CleanIpTestResult(ip = candidateIp, error = "IP address required (no DNS)")
+      }
       if (uuid.isBlank()) {
         return@withContext CleanIpTestResult(ip = candidateIp, error = "UUID missing")
       }

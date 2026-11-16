@@ -7,8 +7,10 @@ import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.net.UnknownHostException
 import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
 
@@ -230,18 +232,38 @@ class WorkerProtocolTest {
   }
 
   @Test
-  fun `clean ip client resolves numeric IPv4 literal in memory without DNS`() {
+  fun `clean ip client resolves numeric IPv4 and IPv6 literals in memory and rejects domain DNS`() {
     val workerHost = "twilight-dream-9e3c.aliahmadiphotoofficial.workers.dev"
     val cleanIp = WorkerProtocol.parseCleanIp("172.67.70.244")!!
     val client =
       WorkerProtocol.createWorkerOkHttpClient(
         workerHost = workerHost,
         cleanIp = cleanIp,
-        fallbackDnsLookup = { throw AssertionError("Network DNS must not be called for Clean IP") },
       )
-    val resolved = client.dns.lookup("172.67.70.244")
-    assertEquals(1, resolved.size)
-    assertEquals("172.67.70.244", resolved.first().hostAddress)
+
+    val resolvedV4 = client.dns.lookup("172.67.70.244")
+    assertEquals(1, resolvedV4.size)
+    assertEquals("172.67.70.244", resolvedV4.first().hostAddress)
+
+    val resolvedV6 = client.dns.lookup("2606:4700::1")
+    assertEquals(1, resolvedV6.size)
+    assertEquals(16, resolvedV6.first().address.size)
+
+    assertThrows(UnknownHostException::class.java) {
+      client.dns.lookup(workerHost)
+    }
+    assertThrows(UnknownHostException::class.java) {
+      client.dns.lookup("example.com")
+    }
     assertEquals(0, client.pingIntervalMillis)
+  }
+
+  @Test
+  fun `resolveTargetIp enforces Zero-DNS IP literal requirement`() {
+    val domainUrl = WorkerProtocol.parseWorkerUrl("https://my-worker.workers.dev/")!!
+    assertEquals(null, WorkerProtocol.resolveTargetIp(domainUrl, null))
+    assertEquals(null, WorkerProtocol.resolveTargetIp(domainUrl, WorkerProtocol.parseCleanIp("not-an-ip.com")))
+    assertEquals("104.16.132.229", WorkerProtocol.resolveTargetIp(domainUrl, WorkerProtocol.parseCleanIp("104.16.132.229:443")))
+    assertEquals("2606:4700::1", WorkerProtocol.resolveTargetIp(domainUrl, WorkerProtocol.parseCleanIp("[2606:4700::1]:8443")))
   }
 }

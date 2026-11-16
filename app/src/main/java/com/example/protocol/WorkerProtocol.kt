@@ -8,6 +8,7 @@ import java.net.Inet6Address
 import java.net.InetAddress
 import java.net.Socket
 import java.net.URI
+import java.net.UnknownHostException
 import java.security.KeyStore
 import java.security.MessageDigest
 import java.security.SecureRandom
@@ -102,15 +103,15 @@ object WorkerProtocol {
     val addrBytes: ByteArray
 
     val ipv4 = parseIpv4Bytes(hostTrimmed)
+    val ipv6 = if (ipv4 == null && hostTrimmed.contains(":")) parseIpv6Bytes(hostTrimmed) else null
     if (ipv4 != null) {
       addrType = 1
       addrBytes = ipv4
-    } else if (hostTrimmed.contains(":")) {
-      val cleanV6 = hostTrimmed.removePrefix("[").removeSuffix("]")
-      val inet6 = InetAddress.getByName(cleanV6) as? Inet6Address
-        ?: throw IllegalArgumentException("Invalid IPv6 host: $hostTrimmed")
+    } else if (ipv6 != null) {
       addrType = 3
-      addrBytes = inet6.address
+      addrBytes = ipv6
+    } else if (hostTrimmed.contains(":")) {
+      throw IllegalArgumentException("Invalid IPv6 host: $hostTrimmed")
     } else {
       val domainBytes = hostTrimmed.toByteArray(Charsets.UTF_8)
       require(domainBytes.isNotEmpty() && domainBytes.size <= 255) {
@@ -218,13 +219,47 @@ object WorkerProtocol {
     return regex.matches(uuid.trim())
   }
 
+  /**
+   * Strict Zero-DNS resolver: converts numeric IPv4/IPv6 literals purely in memory via
+   * InetAddress.getByAddress and refuses all hostname lookups (no OS/ISP/DoH DNS ever used).
+   */
+  private val ZERO_DNS =
+    object : Dns {
+      override fun lookup(hostname: String): List<InetAddress> {
+        val literal = hostname.trim().removePrefix("[").removeSuffix("]")
+        parseIpv4Bytes(literal)?.let { ipv4Bytes ->
+          return listOf(InetAddress.getByAddress(literal, ipv4Bytes))
+        }
+        parseIpv6Bytes(literal)?.let { ipv6Bytes ->
+          return listOf(InetAddress.getByAddress(literal, ipv6Bytes))
+        }
+        throw UnknownHostException("DNS lookup is disabled for connecting: '$hostname'")
+      }
+    }
+
+  fun isIpLiteral(rawHost: String): Boolean {
+    val clean = rawHost.trim().removePrefix("[").removeSuffix("]")
+    return parseIpv4Bytes(clean) != null || parseIpv6Bytes(clean) != null
+  }
+
+  fun resolveTargetIp(
+    parsedUrl: ParsedWorkerUrl,
+    cleanIp: ParsedCleanIp?,
+  ): String? {
+    if (cleanIp != null) {
+      val cleanHost = cleanIp.host.trim().removePrefix("[").removeSuffix("]")
+      return if (isIpLiteral(cleanHost)) cleanHost else null
+    }
+    val urlHost = parsedUrl.host.trim().removePrefix("[").removeSuffix("]")
+    return if (isIpLiteral(urlHost)) urlHost else null
+  }
+
   fun createWorkerOkHttpClient(
     workerHost: String,
     cleanIp: ParsedCleanIp?,
     socketFactory: SocketFactory? = null,
     connectTimeoutSec: Long = 8L,
     workerThreads: Int = 8,
-    fallbackDnsLookup: ((String) -> List<InetAddress>)? = null,
   ): OkHttpClient {
     val threads = workerThreads.coerceIn(2, 32)
     val executor =
@@ -251,6 +286,7 @@ object WorkerProtocol {
         .connectTimeout(connectTimeoutSec, TimeUnit.SECONDS)
         .readTimeout(0, TimeUnit.SECONDS)
         .writeTimeout(15, TimeUnit.SECONDS)
+        .dns(ZERO_DNS)
 
     if (socketFactory != null) {
       builder.socketFactory(socketFactory)
@@ -271,44 +307,11 @@ object WorkerProtocol {
       }
     }
 
-    builder.dns(
-      object : Dns {
-        override fun lookup(hostname: String): List<InetAddress> {
-          // Pure in-memory resolution for numeric IPv4/IPv6 literals (zero DNS queries)
-          parseIpv4Bytes(hostname)?.let { ipv4Bytes ->
-            return listOf(InetAddress.getByAddress(hostname, ipv4Bytes))
-          }
-          if (isNumericIpv6Literal(hostname)) {
-            return InetAddress.getAllByName(hostname).toList()
-          }
-          if (cleanIp != null && hostname.equals(workerHost, ignoreCase = true)) {
-            parseIpv4Bytes(cleanIp.host)?.let { ipv4Bytes ->
-              return listOf(InetAddress.getByAddress(cleanIp.host, ipv4Bytes))
-            }
-            return InetAddress.getAllByName(cleanIp.host).toList()
-          }
-          if (fallbackDnsLookup != null) {
-            val resolved = runCatching { fallbackDnsLookup(hostname) }.getOrNull()
-            if (!resolved.isNullOrEmpty()) return resolved
-          }
-          return Dns.SYSTEM.lookup(hostname)
-        }
-      }
-    )
-
     return builder.build()
   }
 
   private fun isHostnameForSni(host: String): Boolean =
-    host.isNotBlank() && parseIpv4Bytes(host) == null && !host.contains(':')
-
-  private fun isNumericIpv6Literal(host: String): Boolean {
-    val clean = host.removePrefix("[").removeSuffix("]")
-    if (!clean.contains(':')) return false
-    return clean.all { ch ->
-      ch in '0'..'9' || ch in 'a'..'f' || ch in 'A'..'F' || ch == ':' || ch == '.'
-    }
-  }
+    host.isNotBlank() && !isIpLiteral(host) && !host.contains(':')
 
   private fun defaultX509TrustManager(): X509TrustManager {
     val factory = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm())
@@ -418,6 +421,63 @@ object WorkerProtocol {
       val n = parts[i].toIntOrNull() ?: return null
       if (n < 0 || n > 255) return null
       out[i] = n.toByte()
+    }
+    return out
+  }
+
+  fun parseIpv6Bytes(ip: String): ByteArray? {
+    val clean = ip.trim().removePrefix("[").removeSuffix("]")
+    if (clean.isEmpty() || !clean.contains(':')) return null
+    val doubleColonIdx = clean.indexOf("::")
+    if (doubleColonIdx != -1 && clean.indexOf("::", doubleColonIdx + 2) != -1) {
+      return null
+    }
+
+    fun parseHextets(part: String, allowEmbeddedIpv4: Boolean): List<Int>? {
+      if (part.isEmpty()) return emptyList()
+      val tokens = part.split(':')
+      val result = ArrayList<Int>(tokens.size + 1)
+      for (i in tokens.indices) {
+        val tok = tokens[i]
+        if (tok.isEmpty()) return null
+        if (allowEmbeddedIpv4 && i == tokens.lastIndex && tok.contains('.')) {
+          val v4 = parseIpv4Bytes(tok) ?: return null
+          result.add(((v4[0].toInt() and 0xFF) shl 8) or (v4[1].toInt() and 0xFF))
+          result.add(((v4[2].toInt() and 0xFF) shl 8) or (v4[3].toInt() and 0xFF))
+        } else {
+          if (tok.length > 4) return null
+          val valInt = tok.toIntOrNull(16) ?: return null
+          if (valInt < 0 || valInt > 0xFFFF) return null
+          result.add(valInt)
+        }
+      }
+      return result
+    }
+
+    val hextets =
+      if (doubleColonIdx >= 0) {
+        val leftStr = clean.substring(0, doubleColonIdx)
+        val rightStr = clean.substring(doubleColonIdx + 2)
+        val left = parseHextets(leftStr, allowEmbeddedIpv4 = false) ?: return null
+        val right = parseHextets(rightStr, allowEmbeddedIpv4 = true) ?: return null
+        val zeroCount = 8 - (left.size + right.size)
+        if (zeroCount < 1) return null
+        ArrayList<Int>(8).apply {
+          addAll(left)
+          repeat(zeroCount) { add(0) }
+          addAll(right)
+        }
+      } else {
+        val full = parseHextets(clean, allowEmbeddedIpv4 = true) ?: return null
+        if (full.size != 8) return null
+        full
+      }
+
+    if (hextets.size != 8) return null
+    val out = ByteArray(16)
+    for (i in 0 until 8) {
+      out[i * 2] = ((hextets[i] ushr 8) and 0xFF).toByte()
+      out[i * 2 + 1] = (hextets[i] and 0xFF).toByte()
     }
     return out
   }

@@ -265,6 +265,7 @@ class MainViewModel(
   suspend fun validateAndSaveForConnect(
     workerRequiredMsg: String,
     uuidRequiredMsg: String,
+    cleanIpRequiredMsg: String,
   ): Boolean {
     val cur = _draft.value
     val parsedUrl = WorkerProtocol.parseWorkerUrl(cur.workerUrl)
@@ -274,6 +275,11 @@ class MainViewModel(
     }
     if (cur.uuid.isBlank()) {
       _draft.update { it.copy(validationError = uuidRequiredMsg) }
+      return false
+    }
+    val parsedCleanIp = WorkerProtocol.parseCleanIp(cur.cleanIp)
+    if (WorkerProtocol.resolveTargetIp(parsedUrl, parsedCleanIp) == null) {
+      _draft.update { it.copy(validationError = cleanIpRequiredMsg) }
       return false
     }
     val saved =
@@ -287,14 +293,24 @@ class MainViewModel(
     return true
   }
 
-  fun testActiveWorker(workerRequiredMsg: String, uuidRequiredMsg: String) {
+  fun testActiveWorker(
+    workerRequiredMsg: String,
+    uuidRequiredMsg: String,
+    cleanIpRequiredMsg: String,
+  ) {
     val cur = _draft.value
-    if (WorkerProtocol.parseWorkerUrl(cur.workerUrl) == null) {
+    val parsedUrl = WorkerProtocol.parseWorkerUrl(cur.workerUrl)
+    if (parsedUrl == null) {
       _draft.update { it.copy(validationError = workerRequiredMsg) }
       return
     }
     if (cur.uuid.isBlank()) {
       _draft.update { it.copy(validationError = uuidRequiredMsg) }
+      return
+    }
+    val parsedCleanIp = WorkerProtocol.parseCleanIp(cur.cleanIp)
+    if (WorkerProtocol.resolveTargetIp(parsedUrl, parsedCleanIp) == null) {
+      _draft.update { it.copy(validationError = cleanIpRequiredMsg) }
       return
     }
     viewModelScope.launch {

@@ -11,25 +11,16 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
-import okhttp3.ConnectionPool
-import okhttp3.Dispatcher
-import okhttp3.Dns
-import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import okio.ByteString
 import okio.ByteString.Companion.toByteString
 import java.io.ByteArrayOutputStream
-import java.net.InetAddress
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
-import javax.net.SocketFactory
 import kotlin.coroutines.resume
 
 class DnsHandler(
@@ -38,8 +29,6 @@ class DnsHandler(
   private val uuid: String,
   private val cleanIp: ParsedCleanIp?,
   private val dnsServerIp: String,
-  private val protectedSocketFactory: SocketFactory,
-  private val underlyingDnsLookup: (String) -> List<InetAddress>,
   private val sharedWorkerClient: OkHttpClient,
   private val vpnStateRepository: VpnStateRepository,
   private val writeToTun: (ByteArray) -> Unit,
@@ -47,29 +36,6 @@ class DnsHandler(
   private val reverseIpToDomain = ConcurrentHashMap<String, String>()
   private val queryCache = ConcurrentHashMap<String, Pair<ByteArray, Long>>()
   private val inFlightDedup = ConcurrentHashMap<String, CompletableDeferred<ByteArray?>>()
-
-  private val dohClient: OkHttpClient by lazy {
-    val dispatcher =
-      Dispatcher().apply {
-        maxRequests = 64
-        maxRequestsPerHost = 64
-      }
-    OkHttpClient.Builder()
-      .dispatcher(dispatcher)
-      .connectionPool(ConnectionPool(6, 120, TimeUnit.SECONDS))
-      .socketFactory(protectedSocketFactory)
-      .dns(
-        object : Dns {
-          override fun lookup(hostname: String): List<InetAddress> {
-            val resolved = runCatching { underlyingDnsLookup(hostname) }.getOrNull()
-            return if (!resolved.isNullOrEmpty()) resolved else Dns.SYSTEM.lookup(hostname)
-          }
-        }
-      )
-      .connectTimeout(1200, TimeUnit.MILLISECONDS)
-      .readTimeout(1800, TimeUnit.MILLISECONDS)
-      .build()
-  }
 
   /**
    * Keeps 1 warm, persistent WebSocket tunnel open to `dnsServerIp:53` for pipelined
@@ -318,7 +284,6 @@ class DnsHandler(
               val ans =
                 persistentTunnel.query(dnsQuery)
                   ?: resolveViaWorkerTcp(dnsQuery)
-                  ?: resolveViaProtectedDoh(dnsQuery)
               if (ans != null && ans.size >= 12) {
                 queryCache[cacheKey] = ans to (System.currentTimeMillis() + 300_000L)
                 recordReverseMappings(qname, ans)
@@ -346,28 +311,6 @@ class DnsHandler(
         writeToTun(udpReply)
       }
     }
-  }
-
-  private fun resolveViaProtectedDoh(dnsQuery: ByteArray): ByteArray? {
-    val dohUrls = listOf("https://1.1.1.1/dns-query", "https://dns.google/dns-query")
-    for (dohUrl in dohUrls) {
-      val req =
-        Request.Builder()
-          .url(dohUrl)
-          .header("Accept", "application/dns-message")
-          .post(dnsQuery.toRequestBody("application/dns-message".toMediaType()))
-          .build()
-      try {
-        dohClient.newCall(req).execute().use { resp ->
-          if (resp.isSuccessful) {
-            val bytes = resp.body?.bytes()
-            if (bytes != null && bytes.size >= 12) return bytes
-          }
-        }
-      } catch (_: Exception) {
-      }
-    }
-    return null
   }
 
   private suspend fun resolveViaWorkerTcp(dnsQuery: ByteArray): ByteArray? {
@@ -544,9 +487,5 @@ class DnsHandler(
     persistentTunnel.close()
     inFlightDedup.values.forEach { it.complete(null) }
     inFlightDedup.clear()
-    runCatching {
-      dohClient.dispatcher.executorService.shutdown()
-      dohClient.connectionPool.evictAll()
-    }
   }
 }

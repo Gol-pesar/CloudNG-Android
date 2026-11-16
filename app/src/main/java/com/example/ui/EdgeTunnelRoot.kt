@@ -199,6 +199,7 @@ fun EdgeTunnelRoot(viewModel: MainViewModel) {
         viewModel.validateAndSaveForConnect(
           workerRequiredMsg = strings.workerRequiredError,
           uuidRequiredMsg = strings.uuidRequiredError,
+          cleanIpRequiredMsg = strings.cleanIpRequiredError,
         )
       if (!valid) return@launch
 
@@ -409,6 +410,7 @@ fun EdgeTunnelRoot(viewModel: MainViewModel) {
                       viewModel.testActiveWorker(
                         workerRequiredMsg = strings.workerRequiredError,
                         uuidRequiredMsg = strings.uuidRequiredError,
+                        cleanIpRequiredMsg = strings.cleanIpRequiredError,
                       )
                     },
                     onToggleVpn = { startOrStopVpn() },

@@ -42,6 +42,7 @@ import java.io.FileOutputStream
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Socket
+import java.net.UnknownHostException
 import java.nio.ByteBuffer
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.TimeUnit
@@ -157,15 +158,25 @@ class WorkerVpnService : VpnService() {
       }
 
       val cleanIp = WorkerProtocol.parseCleanIp(config.cleanIp)
+      val targetIp = WorkerProtocol.resolveTargetIp(parsedUrl, cleanIp)
+      if (targetIp == null) {
+        val errMsg = "Clean IP (IPv4/IPv6) is required — DNS is disabled"
+        stateRepo.log(LogLevel.ERROR, "VPN", errMsg)
+        stateRepo.updateStatus(VpnStatus.Error(errMsg))
+        tunnelActive = false
+        stopSelf()
+        return@launch
+      }
+
       stateRepo.updateStatus(
         status = VpnStatus.Connecting,
         workerHost = parsedUrl.host,
-        cleanIp = cleanIp?.host ?: "",
+        cleanIp = targetIp,
       )
       stateRepo.log(
         LogLevel.INFO,
         "VPN",
-        "Starting tunnel → ${parsedUrl.host} (Clean IP: ${cleanIp?.host ?: "Direct DNS"})",
+        "Starting tunnel → ${parsedUrl.host} (Direct IP: $targetIp, Zero-DNS)",
       )
 
       val pfd =
@@ -193,13 +204,6 @@ class WorkerVpnService : VpnService() {
       val protectedFactory = createProtectedSocketFactory()
       val workerThreads =
         settings.workerThreads.coerceIn(RamThreadGuide.MIN_THREADS, RamThreadGuide.MAX_THREADS)
-      val underlyingDnsLookup: (String) -> List<InetAddress> = { host ->
-        val net = underlyingNetwork
-        val resolved =
-          if (net != null) runCatching { net.getAllByName(host).toList() }.getOrNull()
-          else null
-        if (!resolved.isNullOrEmpty()) resolved else InetAddress.getAllByName(host).toList()
-      }
 
       val workerClient =
         WorkerProtocol.createWorkerOkHttpClient(
@@ -208,7 +212,6 @@ class WorkerVpnService : VpnService() {
           socketFactory = protectedFactory,
           connectTimeoutSec = 6L,
           workerThreads = workerThreads,
-          fallbackDnsLookup = underlyingDnsLookup,
         )
       sharedWorkerClient = workerClient
 
@@ -235,8 +238,6 @@ class WorkerVpnService : VpnService() {
           uuid = config.uuid,
           cleanIp = cleanIp,
           dnsServerIp = settings.dnsServer.ifBlank { "1.1.1.1" },
-          protectedSocketFactory = protectedFactory,
-          underlyingDnsLookup = underlyingDnsLookup,
           sharedWorkerClient = workerClient,
           vpnStateRepository = stateRepo,
           writeToTun = enqueueToTun,
@@ -260,10 +261,9 @@ class WorkerVpnService : VpnService() {
       stateRepo.updateStatus(
         status = VpnStatus.Connected,
         workerHost = parsedUrl.host,
-        cleanIp = cleanIp?.host ?: "",
+        cleanIp = targetIp,
       )
-      val subtitle =
-        if (cleanIp != null) "${parsedUrl.host} • ${cleanIp.host}" else parsedUrl.host
+      val subtitle = "${parsedUrl.host} • $targetIp"
       promoteToForeground(getString(R.string.vpn_notif_connected_title), subtitle)
       stateRepo.log(
         LogLevel.INFO,
@@ -469,9 +469,9 @@ class WorkerVpnService : VpnService() {
 
     if (settings.bypassLan && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
       runCatching {
-        builder.excludeRoute(IpPrefix(InetAddress.getByName("10.0.0.0"), 8))
-        builder.excludeRoute(IpPrefix(InetAddress.getByName("172.16.0.0"), 12))
-        builder.excludeRoute(IpPrefix(InetAddress.getByName("192.168.0.0"), 16))
+        builder.excludeRoute(IpPrefix(InetAddress.getByAddress(byteArrayOf(10, 0, 0, 0)), 8))
+        builder.excludeRoute(IpPrefix(InetAddress.getByAddress(byteArrayOf(172.toByte(), 16, 0, 0)), 12))
+        builder.excludeRoute(IpPrefix(InetAddress.getByAddress(byteArrayOf(192.toByte(), 168.toByte(), 0, 0)), 16))
       }
     }
 
@@ -507,6 +507,13 @@ class WorkerVpnService : VpnService() {
     return builder.establish()
   }
 
+  private fun resolveLiteralAddress(host: String): InetAddress {
+    val clean = host.trim().removePrefix("[").removeSuffix("]")
+    WorkerProtocol.parseIpv4Bytes(clean)?.let { return InetAddress.getByAddress(clean, it) }
+    WorkerProtocol.parseIpv6Bytes(clean)?.let { return InetAddress.getByAddress(clean, it) }
+    throw UnknownHostException("DNS disabled for socket connection: '$host'")
+  }
+
   private fun createProtectedSocketFactory(): SocketFactory {
     val defaultFactory = SocketFactory.getDefault()
     fun configure(socket: Socket): Socket {
@@ -523,14 +530,14 @@ class WorkerVpnService : VpnService() {
 
       override fun createSocket(host: String, port: Int): Socket {
         val socket = configure(defaultFactory.createSocket())
-        socket.connect(InetSocketAddress(host, port), 6000)
+        socket.connect(InetSocketAddress(resolveLiteralAddress(host), port), 6000)
         return socket
       }
 
       override fun createSocket(host: String, port: Int, localHost: InetAddress, localPort: Int): Socket {
         val socket = configure(defaultFactory.createSocket())
         socket.bind(InetSocketAddress(localHost, localPort))
-        socket.connect(InetSocketAddress(host, port), 6000)
+        socket.connect(InetSocketAddress(resolveLiteralAddress(host), port), 6000)
         return socket
       }
 
