@@ -1,6 +1,7 @@
 package com.example.protocol
 
 import okhttp3.Dns
+import okhttp3.EventListener
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.net.Inet4Address
@@ -43,6 +44,12 @@ object WorkerProtocol {
   const val SUBPROTOCOL = "chat.v2"
   private val random = SecureRandom()
 
+  fun maskUuid(uuid: String): String {
+    val clean = uuid.trim()
+    if (clean.length <= 8) return "****"
+    return "${clean.take(4)}…${clean.takeLast(4)}"
+  }
+
   fun xorBuf(data: ByteArray, key: ByteArray): ByteArray {
     if (key.isEmpty()) return data.copyOf()
     val out = ByteArray(data.size)
@@ -77,6 +84,7 @@ object WorkerProtocol {
   fun deriveKey(uuid: String, nonce: ByteArray): ByteArray {
     val tb = uuid.trim().toByteArray(Charsets.UTF_8)
     require(tb.isNotEmpty()) { "UUID/token must not be empty" }
+    require(nonce.size >= 16) { "Nonce must be at least 16 bytes" }
     val key = ByteArray(16)
     for (i in 0 until 16) {
       key[i] = (tb[i % tb.size].toInt() xor nonce[i].toInt()).toByte()
@@ -85,8 +93,8 @@ object WorkerProtocol {
   }
 
   /**
-   * Encodes the exact init frame expected by worker.js `parseInit(data, token)`:
-   * [16 bytes nonce] + XOR([1 byte cmd][2 bytes BE port][1 byte addrType][addr bytes][initialPayload], key) + [8 bytes padding]
+   * Encodes the exact init frame expected by worker.js `parseInit(data, token)` and `Cl2.py`:
+   * [16 bytes nonce] + XOR([1 byte cmd][2 bytes BE port][1 byte addrType][addr bytes][initialPayload], key) + [8 bytes HMAC-SHA256(key, enc)[:8]]
    */
   fun buildInitPacket(
     uuid: String,
@@ -95,6 +103,9 @@ object WorkerProtocol {
     initialPayload: ByteArray = ByteArray(0),
     cmd: Int = 1,
   ): Pair<ByteArray, ByteArray> {
+    require(cmd == 1 || cmd == 2) { "Unsupported Worker command: $cmd" }
+    require(targetPort in 1..65535) { "Port out of range: $targetPort" }
+
     val nonce = ByteArray(16).also { random.nextBytes(it) }
     val key = deriveKey(uuid, nonce)
 
@@ -137,7 +148,10 @@ object WorkerProtocol {
     }
 
     val encrypted = xorBuf(body, key)
-    val trailer = ByteArray(8).also { random.nextBytes(it) }
+    val mac = Mac.getInstance("HmacSHA256").apply {
+      init(SecretKeySpec(key, "HmacSHA256"))
+    }
+    val trailer = mac.doFinal(encrypted)
 
     val packet = ByteArray(16 + encrypted.size + 8)
     System.arraycopy(nonce, 0, packet, 0, 16)
@@ -151,7 +165,7 @@ object WorkerProtocol {
    * xorBuf(hmacSha256(key, "OK").slice(0, 16), key)
    */
   fun verifyAck(ackFrame: ByteArray, key: ByteArray): Boolean {
-    if (ackFrame.size != 16) return false
+    if (ackFrame.size != 16 || key.size != 16) return false
     val mac = Mac.getInstance("HmacSHA256")
     mac.init(SecretKeySpec(key, "HmacSHA256"))
     val digest = mac.doFinal("OK".toByteArray(Charsets.UTF_8))
@@ -220,22 +234,19 @@ object WorkerProtocol {
   }
 
   /**
-   * Strict Zero-DNS resolver: converts numeric IPv4/IPv6 literals purely in memory via
-   * InetAddress.getByAddress and refuses all hostname lookups (no OS/ISP/DoH DNS ever used).
+   * Pure in-memory IP literal parser returning a single-family InetAddress with hostname pinned
+   * to [workerHost], avoiding any DNS lookup and avoiding Happy Eyeballs family mixing.
    */
-  private val ZERO_DNS =
-    object : Dns {
-      override fun lookup(hostname: String): List<InetAddress> {
-        val literal = hostname.trim().removePrefix("[").removeSuffix("]")
-        parseIpv4Bytes(literal)?.let { ipv4Bytes ->
-          return listOf(InetAddress.getByAddress(literal, ipv4Bytes))
-        }
-        parseIpv6Bytes(literal)?.let { ipv6Bytes ->
-          return listOf(InetAddress.getByAddress(literal, ipv6Bytes))
-        }
-        throw UnknownHostException("DNS lookup is disabled for connecting: '$hostname'")
-      }
+  fun resolveIpLiteralInMemory(workerHost: String, rawIp: String): InetAddress? {
+    val literal = rawIp.trim().removePrefix("[").removeSuffix("]")
+    parseIpv4Bytes(literal)?.let { ipv4Bytes ->
+      return InetAddress.getByAddress(workerHost, ipv4Bytes)
     }
+    parseIpv6Bytes(literal)?.let { ipv6Bytes ->
+      return InetAddress.getByAddress(workerHost, ipv6Bytes)
+    }
+    return null
+  }
 
   fun isIpLiteral(rawHost: String): Boolean {
     val clean = rawHost.trim().removePrefix("[").removeSuffix("]")
@@ -254,12 +265,22 @@ object WorkerProtocol {
     return if (isIpLiteral(urlHost)) urlHost else null
   }
 
+  /**
+   * Creates an OkHttpClient matching Cl2.py's websockets.connect() semantics:
+   * - HTTP/1.1 only, no pingInterval, compression=None (strips Sec-WebSocket-Extensions)
+   * - URL keeps WORKER_HOST so TLS SNI, Host header, and X.509 cert verification stay native
+   * - When [cleanIp] is a numeric IPv4/IPv6 literal, Dns returns ONLY that single InetAddress
+   *   constructed in memory (zero OS DNS lookup, no Happy Eyeballs mixing)
+   * - Otherwise uses Dns.SYSTEM (optionally putting IPv6 first when [preferIpv6Fallback] is true)
+   */
   fun createWorkerOkHttpClient(
     workerHost: String,
     cleanIp: ParsedCleanIp?,
     socketFactory: SocketFactory? = null,
-    connectTimeoutSec: Long = 8L,
+    connectTimeoutSec: Long = 15L,
     workerThreads: Int = 8,
+    preferIpv6Fallback: Boolean = false,
+    eventListenerFactory: EventListener.Factory? = null,
   ): OkHttpClient {
     val threads = workerThreads.coerceIn(2, 32)
     val executor =
@@ -269,97 +290,79 @@ object WorkerProtocol {
         60L,
         TimeUnit.SECONDS,
         java.util.concurrent.SynchronousQueue(),
-        okhttp3.internal.threadFactory("CloudNG-Worker", false),
+        okhttp3.internal.threadFactory("CloudNG-Worker", true),
       )
     val dispatcher =
       okhttp3.Dispatcher(executor).apply {
         maxRequests = (threads * 16).coerceIn(128, 512)
         maxRequestsPerHost = (threads * 8).coerceIn(32, 256)
       }
+
+    val pinnedAddr =
+      cleanIp?.host?.let { rawIp ->
+        resolveIpLiteralInMemory(workerHost, rawIp)
+      }
+
+    val customDns =
+      if (pinnedAddr != null) {
+        object : Dns {
+          override fun lookup(hostname: String): List<InetAddress> {
+            if (hostname.equals(workerHost, ignoreCase = true)) {
+              // Single address only (IPv4 OR IPv6) so multi-address selection cannot switch family
+              return listOf(pinnedAddr)
+            }
+            resolveIpLiteralInMemory(hostname, hostname)?.let { return listOf(it) }
+            throw UnknownHostException("DNS disabled for pinned client: '$hostname'")
+          }
+        }
+      } else {
+        object : Dns {
+          override fun lookup(hostname: String): List<InetAddress> {
+            resolveIpLiteralInMemory(hostname, hostname)?.let { return listOf(it) }
+            val results = Dns.SYSTEM.lookup(hostname)
+            return if (preferIpv6Fallback) {
+              results.sortedByDescending { it is Inet6Address }
+            } else {
+              results
+            }
+          }
+        }
+      }
+
     val builder =
       OkHttpClient.Builder()
         .dispatcher(dispatcher)
         .connectionPool(
-          okhttp3.ConnectionPool((threads * 2).coerceIn(12, 64), 120L, TimeUnit.SECONDS)
+          okhttp3.ConnectionPool((threads * 2).coerceIn(8, 32), 90L, TimeUnit.SECONDS)
         )
         .protocols(listOf(okhttp3.Protocol.HTTP_1_1))
+        .retryOnConnectionFailure(true)
         .connectTimeout(connectTimeoutSec, TimeUnit.SECONDS)
         .readTimeout(0, TimeUnit.SECONDS)
         .writeTimeout(15, TimeUnit.SECONDS)
-        .dns(ZERO_DNS)
+        .dns(customDns)
+        .addInterceptor { chain ->
+          val req = chain.request()
+          if (req.header("Upgrade").equals("websocket", ignoreCase = true)) {
+            chain.proceed(
+              req.newBuilder()
+                .removeHeader("Sec-WebSocket-Extensions")
+                .header("Accept-Encoding", "identity")
+                .build()
+            )
+          } else {
+            chain.proceed(req)
+          }
+        }
 
     if (socketFactory != null) {
       builder.socketFactory(socketFactory)
     }
-
-    if (cleanIp != null && isHostnameForSni(workerHost)) {
-      val trustManager = defaultX509TrustManager()
-      val sslContext =
-        SSLContext.getInstance("TLS").apply {
-          init(null, arrayOf(trustManager), null)
-        }
-      builder.sslSocketFactory(
-        SniPinningSslSocketFactory(sslContext.socketFactory, workerHost),
-        trustManager,
-      )
-      builder.hostnameVerifier { _, session ->
-        HttpsURLConnection.getDefaultHostnameVerifier().verify(workerHost, session)
-      }
+    if (eventListenerFactory != null) {
+      builder.eventListenerFactory(eventListenerFactory)
     }
 
     return builder.build()
-  }
-
-  private fun isHostnameForSni(host: String): Boolean =
-    host.isNotBlank() && !isIpLiteral(host) && !host.contains(':')
-
-  private fun defaultX509TrustManager(): X509TrustManager {
-    val factory = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm())
-    factory.init(null as KeyStore?)
-    return factory.trustManagers.filterIsInstance<X509TrustManager>().first()
-  }
-
-  private class SniPinningSslSocketFactory(
-    private val delegate: SSLSocketFactory,
-    private val sniHost: String,
-  ) : SSLSocketFactory() {
-    override fun getDefaultCipherSuites(): Array<String> = delegate.defaultCipherSuites
-
-    override fun getSupportedCipherSuites(): Array<String> = delegate.supportedCipherSuites
-
-    override fun createSocket(s: Socket?, host: String?, port: Int, autoClose: Boolean): Socket {
-      // Force SNI & Conscrypt TLS 1.3 session cache key to workerHost even though TCP connected to cleanIp
-      return applySni(delegate.createSocket(s, sniHost, port, autoClose))
-    }
-
-    override fun createSocket(host: String?, port: Int): Socket =
-      applySni(delegate.createSocket(host, port))
-
-    override fun createSocket(
-      host: String?,
-      port: Int,
-      localHost: InetAddress?,
-      localPort: Int,
-    ): Socket = applySni(delegate.createSocket(host, port, localHost, localPort))
-
-    override fun createSocket(host: InetAddress?, port: Int): Socket =
-      applySni(delegate.createSocket(host, port))
-
-    override fun createSocket(
-      address: InetAddress?,
-      port: Int,
-      localAddress: InetAddress?,
-      localPort: Int,
-    ): Socket = applySni(delegate.createSocket(address, port, localAddress, localPort))
-
-    private fun applySni(socket: Socket): Socket {
-      if (socket is SSLSocket) {
-        val params = socket.sslParameters
-        params.serverNames = listOf(SNIHostName(sniHost))
-        socket.sslParameters = params
-      }
-      return socket
-    }
   }
 
   private fun formatUrlHost(rawHost: String): String {
@@ -373,17 +376,12 @@ object WorkerProtocol {
   ): Request {
     val defaultPort = if (parsedUrl.isTls) 443 else 80
     val effectivePort = cleanIp?.port ?: parsedUrl.port
-    val urlHost = cleanIp?.let { formatUrlHost(it.host) } ?: formatUrlHost(parsedUrl.host)
+    val urlHost = formatUrlHost(parsedUrl.host)
     val urlPortSuffix = if (effectivePort != defaultPort) ":$effectivePort" else ""
     val targetUrl = "${parsedUrl.httpScheme}://$urlHost$urlPortSuffix/"
 
-    val hostHeader =
-      if (parsedUrl.port != defaultPort) "${parsedUrl.host}:${parsedUrl.port}"
-      else parsedUrl.host
-
     return Request.Builder()
       .url(targetUrl)
-      .header("Host", hostHeader)
       .header("Accept-Encoding", "identity")
       .head()
       .build()
@@ -395,21 +393,15 @@ object WorkerProtocol {
   ): Request {
     val defaultPort = if (parsedUrl.isTls) 443 else 80
     val effectivePort = cleanIp?.port ?: parsedUrl.port
-    // Direct URL host swap (matching Cl2.py): connect straight to cleanIp without resolving workerHost
-    val urlHost = cleanIp?.let { formatUrlHost(it.host) } ?: formatUrlHost(parsedUrl.host)
+    // Keep WORKER_HOST in URL so OkHttp sets Host header, TLS SNI, and cert verification automatically
+    val urlHost = formatUrlHost(parsedUrl.host)
     val urlPortSuffix = if (effectivePort != defaultPort) ":$effectivePort" else ""
     val targetUrl = "${parsedUrl.httpScheme}://$urlHost$urlPortSuffix${parsedUrl.pathAndQuery}"
 
-    val hostHeader =
-      if (parsedUrl.port != defaultPort) "${parsedUrl.host}:${parsedUrl.port}"
-      else parsedUrl.host
-
     return Request.Builder()
       .url(targetUrl)
-      .header("Host", hostHeader)
       .header("Sec-WebSocket-Protocol", SUBPROTOCOL)
       .header("Accept-Encoding", "identity")
-      .header("User-Agent", "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36")
       .build()
   }
 

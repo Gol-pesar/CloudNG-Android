@@ -46,6 +46,34 @@ class WorkerProtocolTest {
     assertEquals("example.com", host)
     val extractedPayload = body.copyOfRange(5 + domainLen, body.size)
     assertArrayEquals(payload, extractedPayload)
+
+    // Verify Cl2.py 8-byte HMAC-SHA256 trailer parity
+    val mac = Mac.getInstance("HmacSHA256").apply { init(SecretKeySpec(key, "HmacSHA256")) }
+    val expectedTrailer = mac.doFinal(enc).copyOfRange(0, 8)
+    val actualTrailer = packet.copyOfRange(packet.size - 8, packet.size)
+    assertArrayEquals(expectedTrailer, actualTrailer)
+  }
+
+  @Test
+  fun `init packet encodes IPv4 addrType 1 and IPv6 addrType 3 matching worker parseInit`() {
+    val uuid = "63ae8279-fafa-4dd0-b2ef-9d6a4ec3ffdd"
+
+    // IPv4 target (addrType = 1, 4 bytes)
+    val (pktV4, keyV4) = WorkerProtocol.buildInitPacket(uuid, "1.1.1.1", 80)
+    val bodyV4 = WorkerProtocol.xorBuf(pktV4.copyOfRange(16, pktV4.size - 8), keyV4)
+    assertEquals(1, bodyV4[3].toInt() and 0xFF)
+    assertArrayEquals(byteArrayOf(1, 1, 1, 1), bodyV4.copyOfRange(4, 8))
+
+    // IPv6 target (addrType = 3, 16 bytes)
+    val (pktV6, keyV6) = WorkerProtocol.buildInitPacket(uuid, "2606:4700:4700::1111", 443)
+    val bodyV6 = WorkerProtocol.xorBuf(pktV6.copyOfRange(16, pktV6.size - 8), keyV6)
+    assertEquals(3, bodyV6[3].toInt() and 0xFF)
+    assertEquals(4 + 16, bodyV6.size)
+    assertEquals(0x26, bodyV6[4].toInt() and 0xFF)
+    assertEquals(0x06, bodyV6[5].toInt() and 0xFF)
+    assertEquals(0x11, bodyV6[19].toInt() and 0xFF)
+
+    assertEquals("63ae…ffdd", WorkerProtocol.maskUuid(uuid))
   }
 
   @Test
@@ -58,6 +86,7 @@ class WorkerProtocolTest {
 
     assertTrue(WorkerProtocol.verifyAck(serverFrame, key))
     assertFalse(WorkerProtocol.verifyAck(ByteArray(16), key))
+    assertFalse(WorkerProtocol.verifyAck(serverFrame, ByteArray(5)))
   }
 
   @Test
@@ -207,55 +236,56 @@ class WorkerProtocolTest {
   }
 
   @Test
-  fun `clean ip request replaces URL host without changing Host header`() {
+  fun `clean ip request keeps WORKER_HOST in URL for native SNI and applies optional port`() {
     val parsedUrl =
       WorkerProtocol.parseWorkerUrl("wss://twilight-dream-9e3c.aliahmadiphotoofficial.workers.dev/")!!
     val cleanIpv4 = WorkerProtocol.parseCleanIp("172.67.70.244")!!
     val wsReq = WorkerProtocol.buildWebSocketRequest(parsedUrl, cleanIpv4)
-    assertEquals("172.67.70.244", wsReq.url.host)
+    assertEquals("twilight-dream-9e3c.aliahmadiphotoofficial.workers.dev", wsReq.url.host)
     assertEquals(443, wsReq.url.port)
-    assertEquals("twilight-dream-9e3c.aliahmadiphotoofficial.workers.dev", wsReq.header("Host"))
     assertEquals("chat.v2", wsReq.header("Sec-WebSocket-Protocol"))
     assertEquals("identity", wsReq.header("Accept-Encoding"))
 
     val cleanIpv6 = WorkerProtocol.parseCleanIp("[2606:4700::1]:8443")!!
     val wsReqV6 = WorkerProtocol.buildWebSocketRequest(parsedUrl, cleanIpv6)
-    assertEquals("2606:4700::1", wsReqV6.url.host)
+    assertEquals("twilight-dream-9e3c.aliahmadiphotoofficial.workers.dev", wsReqV6.url.host)
     assertEquals(8443, wsReqV6.url.port)
-    assertEquals("twilight-dream-9e3c.aliahmadiphotoofficial.workers.dev", wsReqV6.header("Host"))
 
     val warmReq = WorkerProtocol.buildPrewarmRequest(parsedUrl, cleanIpv4)
     assertEquals("HEAD", warmReq.method)
-    assertEquals("172.67.70.244", warmReq.url.host)
-    assertEquals("twilight-dream-9e3c.aliahmadiphotoofficial.workers.dev", warmReq.header("Host"))
+    assertEquals("twilight-dream-9e3c.aliahmadiphotoofficial.workers.dev", warmReq.url.host)
     assertEquals("identity", warmReq.header("Accept-Encoding"))
   }
 
   @Test
-  fun `clean ip client resolves numeric IPv4 and IPv6 literals in memory and rejects domain DNS`() {
+  fun `pinned clean ip client resolves workerHost to single IPv4 or IPv6 in memory and rejects other domains`() {
     val workerHost = "twilight-dream-9e3c.aliahmadiphotoofficial.workers.dev"
-    val cleanIp = WorkerProtocol.parseCleanIp("172.67.70.244")!!
-    val client =
+    val cleanIpv4 = WorkerProtocol.parseCleanIp("172.67.70.244")!!
+    val clientV4 =
       WorkerProtocol.createWorkerOkHttpClient(
         workerHost = workerHost,
-        cleanIp = cleanIp,
+        cleanIp = cleanIpv4,
       )
 
-    val resolvedV4 = client.dns.lookup("172.67.70.244")
-    assertEquals(1, resolvedV4.size)
-    assertEquals("172.67.70.244", resolvedV4.first().hostAddress)
-
-    val resolvedV6 = client.dns.lookup("2606:4700::1")
-    assertEquals(1, resolvedV6.size)
-    assertEquals(16, resolvedV6.first().address.size)
+    val pinnedV4 = clientV4.dns.lookup(workerHost)
+    assertEquals(1, pinnedV4.size)
+    assertTrue(pinnedV4.first() is java.net.Inet4Address)
+    assertEquals("172.67.70.244", pinnedV4.first().hostAddress)
 
     assertThrows(UnknownHostException::class.java) {
-      client.dns.lookup(workerHost)
+      clientV4.dns.lookup("example.com")
     }
-    assertThrows(UnknownHostException::class.java) {
-      client.dns.lookup("example.com")
-    }
-    assertEquals(0, client.pingIntervalMillis)
+    assertEquals(0, clientV4.pingIntervalMillis)
+
+    val cleanIpv6 = WorkerProtocol.parseCleanIp("2606:4700::1")!!
+    val clientV6 =
+      WorkerProtocol.createWorkerOkHttpClient(
+        workerHost = workerHost,
+        cleanIp = cleanIpv6,
+      )
+    val pinnedV6 = clientV6.dns.lookup(workerHost)
+    assertEquals(1, pinnedV6.size)
+    assertTrue(pinnedV6.first() is java.net.Inet6Address)
   }
 
   @Test

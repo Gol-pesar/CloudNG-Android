@@ -10,6 +10,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import okhttp3.OkHttpClient
+import okhttp3.Request
 import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
@@ -20,6 +21,7 @@ import java.util.TreeMap
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.random.Random
@@ -33,16 +35,38 @@ class TcpSessionManager(
   private val hostMapper: VirtualHostMapper,
   private val vpnStateRepository: VpnStateRepository,
   workerThreads: Int = 8,
+  tunMtu: Int = 1440,
   private val writeToTun: (ByteArray) -> Unit,
+  private val webSocketConnector: (Request, WebSocketListener) -> WebSocket = { req, listener ->
+    sharedWorkerClient.newWebSocket(req, listener)
+  },
 ) {
   companion object {
-    private const val MSS = 1400
-    private const val SERVER_WINDOW_SCALE = 7 // 128x multiplier -> 16384 * 128 = 2 MB window
-    private const val SCALED_ACK_WINDOW = 16384
+    private const val SERVER_WINDOW_SCALE = 2 // 4x multiplier -> max scaled window 262,140 B matching buffer budget
+    private const val WINDOW_SHIFT_FACTOR = 1 shl SERVER_WINDOW_SCALE
     private const val SESSION_IDLE_MS = 120_000L
-    private const val WS_BACKPRESSURE_LIMIT_BYTES = 3 * 1024 * 1024L
+    private const val HALF_CLOSED_IDLE_MS = 20_000L
+    private const val CLOSING_LINGER_MS = 3_000L
+    private const val MAX_PRE_OPEN_BUFFER_BYTES = 256 * 1024
+    private const val MAX_PRE_OPEN_HARD_CAP_BYTES = 384 * 1024
+    private const val WS_BACKPRESSURE_HIGH_WATER_BYTES = 1024 * 1024L
+    private const val WS_BACKPRESSURE_LOW_WATER_BYTES = 256 * 1024L
     private const val MAX_OOO_SEGMENTS = 32
+    private const val MAX_OOO_GAP_BYTES = 131_072L
+    private val EMPTY_BYTES = ByteArray(0)
+
+    internal fun isSeqBefore(a: Long, b: Long): Boolean {
+      val diff = ((a - b) and 0xFFFFFFFFL).toInt()
+      return diff < 0
+    }
+
+    internal fun isSeqAfter(a: Long, b: Long): Boolean {
+      val diff = ((a - b) and 0xFFFFFFFFL).toInt()
+      return diff > 0
+    }
   }
+
+  private val mss = (tunMtu.coerceIn(1280, 1460) - 40).coerceIn(1200, 1400)
 
   private val threadCount = workerThreads.coerceIn(2, 32)
   private val laneIdCounter = AtomicInteger(0)
@@ -51,12 +75,13 @@ class TcpSessionManager(
       Executors.newSingleThreadExecutor { runnable ->
         Thread(runnable, "CloudNG-Lane-${laneIdCounter.incrementAndGet()}").apply {
           isDaemon = true
-          priority = Thread.MAX_PRIORITY
+          priority = Thread.NORM_PRIORITY
         }
       }
     }
 
   @Volatile private var isShutdown = false
+  @Volatile private var lastBackpressureLogMs = 0L
 
   data class TcpKey(
     val srcIp: Int,
@@ -68,17 +93,19 @@ class TcpSessionManager(
   private enum class State {
     CONNECTING,
     ESTABLISHED,
+    CLOSING,
     CLOSED,
   }
 
   private inner class TcpSession(
     val key: TcpKey,
     val targetHost: String,
-    initialClientSeq: Long,
+    val initialClientSeq: Long,
     private val negotiateWindowScale: Boolean,
   ) {
     val createdAtMs = System.currentTimeMillis()
     @Volatile var lastActivityMs = createdAtMs
+    @Volatile var closingAtMs = 0L
     @Volatile var state = State.CONNECTING
     @Volatile var clientNextSeq = (initialClientSeq + 1L) and 0xFFFFFFFFL
     @Volatile var serverSeq = Random.nextLong(10_000L, 0x7FFF_FFFFL)
@@ -87,6 +114,8 @@ class TcpSessionManager(
     @Volatile var initSent = false
     @Volatile var ackVerified = false
     @Volatile var clientFinReceived = false
+    @Volatile var serverFinSent = false
+    @Volatile var zeroWindowAdvertised = false
     private var unackedClientBytes = 0
     private val pendingPreOpen = ByteArrayOutputStream()
     private val oooBuffer = TreeMap<Long, ByteArray>()
@@ -100,28 +129,59 @@ class TcpSessionManager(
     }
 
     private fun currentAdvertisedWindow(activeWs: WebSocket?): Int {
-      val congested = activeWs != null && activeWs.queueSize() > WS_BACKPRESSURE_LIMIT_BYTES
+      val budgetBytes =
+        if (!initSent) {
+          (MAX_PRE_OPEN_BUFFER_BYTES - pendingPreOpen.size()).coerceAtLeast(0).toLong()
+        } else {
+          val queued = activeWs?.queueSize() ?: 0L
+          (WS_BACKPRESSURE_HIGH_WATER_BYTES - queued).coerceAtLeast(0L)
+        }
+      if (budgetBytes <= 0L) {
+        zeroWindowAdvertised = true
+        return 0
+      }
       return if (negotiateWindowScale) {
-        if (congested) 64 else SCALED_ACK_WINDOW
+        ((budgetBytes / WINDOW_SHIFT_FACTOR).coerceIn(1L, 65535L)).toInt()
       } else {
-        if (congested) 4096 else 65535
+        budgetBytes.coerceIn(1L, 65535L).toInt()
       }
     }
 
-    /**
-     * 0-RTT Optimistic Handshake with RFC 1323 Window Scaling and zero-copy XOR.
-     */
+    private fun maybeScheduleWindowResume(activeWs: WebSocket) {
+      if (!zeroWindowAdvertised) return
+      val queueNow = activeWs.queueSize()
+      if (queueNow <= WS_BACKPRESSURE_LOW_WATER_BYTES && state == State.ESTABLISHED) {
+        zeroWindowAdvertised = false
+        sendAck(currentAdvertisedWindow(activeWs))
+      }
+    }
+
     fun startTunnelOptimistic() {
       sendSynAck()
 
       val request = WorkerProtocol.buildWebSocketRequest(parsedWorkerUrl, cleanIp)
       ws =
-        sharedWorkerClient.newWebSocket(
+        webSocketConnector(
           request,
           object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
+              val negProto = response.header("Sec-WebSocket-Protocol")
+              if (negProto != null && !negProto.equals(WorkerProtocol.SUBPROTOCOL, ignoreCase = true)) {
+                vpnStateRepository.log(
+                  LogLevel.ERROR,
+                  "TCP",
+                  "Subprotocol mismatch for $targetHost:${key.dstPort}: '$negProto'",
+                )
+                webSocket.close(1002, "Unexpected subprotocol: $negProto")
+                sendRstAck()
+                closeInternal()
+                return
+              }
+
+              var needWindowResumeAck = false
+              var sendFailed = false
               synchronized(uploadLock) {
-                if (state == State.CLOSED) {
+                if (state == State.CLOSED || state == State.CLOSING) {
                   webSocket.cancel()
                   return
                 }
@@ -133,14 +193,36 @@ class TcpSessionManager(
                   )
                 cryptoKey = encKey
                 initSent = true
-                webSocket.send(initFrame.toByteString())
+                if (!webSocket.send(initFrame.toByteString())) {
+                  sendFailed = true
+                  return@synchronized
+                }
 
                 if (pendingPreOpen.size() > 0) {
                   val buffered = pendingPreOpen.toByteArray()
                   pendingPreOpen.reset()
                   WorkerProtocol.xorInPlace(buffered, encKey)
-                  webSocket.send(buffered.toByteString())
+                  if (!webSocket.send(buffered.toByteString())) {
+                    sendFailed = true
+                    return@synchronized
+                  }
                 }
+                if (zeroWindowAdvertised && webSocket.queueSize() < WS_BACKPRESSURE_HIGH_WATER_BYTES) {
+                  zeroWindowAdvertised = false
+                  needWindowResumeAck = true
+                }
+              }
+
+              if (sendFailed) {
+                vpnStateRepository.log(
+                  LogLevel.WARN,
+                  "TCP",
+                  "WebSocket queue refused init/pre-open payload for $targetHost:${key.dstPort}",
+                )
+                sendRstAck()
+                closeInternal()
+              } else if (needWindowResumeAck) {
+                sendAck(currentAdvertisedWindow(webSocket))
               }
             }
 
@@ -151,14 +233,16 @@ class TcpSessionManager(
               if (!ackVerified) {
                 if (WorkerProtocol.verifyAck(raw, cryptoKey)) {
                   ackVerified = true
-                  state = State.ESTABLISHED
+                  if (state == State.CONNECTING) {
+                    state = State.ESTABLISHED
+                  }
                   val rtt = System.currentTimeMillis() - createdAtMs
                   vpnStateRepository.updateHandshakeRtt(rtt)
                 } else {
                   vpnStateRepository.log(
                     LogLevel.ERROR,
                     "TCP",
-                    "Invalid Worker ACK for $targetHost:${key.dstPort}",
+                    "Invalid Worker ACK for $targetHost:${key.dstPort} (check UUID)",
                   )
                   sendRstAck()
                   closeInternal()
@@ -170,40 +254,88 @@ class TcpSessionManager(
               WorkerProtocol.xorInPlace(raw, cryptoKey)
               rxBytes.addAndGet(raw.size.toLong())
               sendDataChunksToTun(raw)
+              maybeScheduleWindowResume(webSocket)
             }
 
             override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
-              if (state != State.CLOSED) {
-                sendFinAck()
-              }
-              closeInternal()
+              initiateRemoteClose()
             }
 
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-              if (state != State.CLOSED) {
-                sendFinAck()
-              }
-              closeInternal()
+              initiateRemoteClose()
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
               if (!ackVerified && state != State.CLOSED) {
+                val errDetail =
+                  if (response != null) "HTTP ${response.code}" else (t.message ?: t.javaClass.simpleName)
                 vpnStateRepository.log(
                   LogLevel.WARN,
                   "TCP",
-                  "Dial failed $targetHost:${key.dstPort}: ${t.message}",
+                  "Dial failed $targetHost:${key.dstPort}: $errDetail",
                 )
                 sendRstAck()
+                closeInternal()
               } else if (state != State.CLOSED) {
-                sendFinAck()
+                initiateRemoteClose()
               }
-              closeInternal()
             }
           },
         )
     }
 
-    fun handleClientPacket(raw: ByteArray, parsed: Ipv4Packet.ParsedPacket) {
+    private fun initiateRemoteClose() {
+      synchronized(tunTxLock) {
+        if (state == State.CLOSED) return
+        if (!serverFinSent) {
+          serverFinSent = true
+          closingAtMs = System.currentTimeMillis()
+          state = State.CLOSING
+          val pkt =
+            Ipv4Packet.buildTcpPacket(
+              srcIp = key.dstIp,
+              dstIp = key.srcIp,
+              srcPort = key.dstPort,
+              dstPort = key.srcPort,
+              seq = serverSeq,
+              ack = clientNextSeq,
+              flags = Ipv4Packet.TCP_FIN or Ipv4Packet.TCP_ACK,
+              window = currentAdvertisedWindow(ws),
+            )
+          serverSeq = (serverSeq + 1L) and 0xFFFFFFFFL
+          writeToTun(pkt)
+        }
+      }
+      runCatching { ws?.close(1000, "EOF") }
+    }
+
+    fun retransmitSynAck() {
+      touch()
+      synchronized(tunTxLock) {
+        if (state != State.CONNECTING && state != State.ESTABLISHED) return
+        // Re-emit SYN-ACK with original ISN = serverSeq - 1
+        val origSynSeq = (serverSeq - 1L) and 0xFFFFFFFFL
+        val pkt =
+          Ipv4Packet.buildTcpPacket(
+            srcIp = key.dstIp,
+            dstIp = key.srcIp,
+            srcPort = key.dstPort,
+            dstPort = key.srcPort,
+            seq = origSynSeq,
+            ack = clientNextSeq,
+            flags = Ipv4Packet.TCP_SYN or Ipv4Packet.TCP_ACK,
+            window = 65535,
+            mss = mss,
+            windowScale = if (negotiateWindowScale) SERVER_WINDOW_SCALE else null,
+          )
+        writeToTun(pkt)
+      }
+    }
+
+    fun handleClientPacket(
+      parsed: Ipv4Packet.ParsedPacket,
+      payloadData: ByteArray,
+    ) {
       touch()
       if (state == State.CLOSED) return
 
@@ -213,76 +345,156 @@ class TcpSessionManager(
         return
       }
 
-      if (parsed.payloadLength > 0) {
+      if (payloadData.isNotEmpty() && !clientFinReceived) {
         val expected = clientNextSeq
         if (parsed.tcpSeq == expected) {
-          val firstPayload =
-            raw.copyOfRange(parsed.payloadOffset, parsed.payloadOffset + parsed.payloadLength)
-
-          // Coalesce contiguous out-of-order segments into a single WebSocket binary frame
-          val combined =
-            if (oooBuffer.isEmpty()) {
-              firstPayload
-            } else {
-              val batch = ByteArrayOutputStream(firstPayload.size * 2)
-              batch.write(firstPayload)
-              var nextExpected = (expected + firstPayload.size) and 0xFFFFFFFFL
-              while (true) {
-                val seg = oooBuffer.remove(nextExpected) ?: break
-                batch.write(seg)
-                nextExpected = (nextExpected + seg.size) and 0xFFFFFFFFL
-              }
-              batch.toByteArray()
-            }
-
-          processInOrderPayload(combined)
-          unackedClientBytes += combined.size
-
-          val hasPsh = (flags and Ipv4Packet.TCP_PSH) != 0
-          val activeWs = ws
-          val congested = activeWs != null && activeWs.queueSize() > WS_BACKPRESSURE_LIMIT_BYTES
-          if (hasPsh || congested || unackedClientBytes >= MSS * 2) {
-            unackedClientBytes = 0
-            sendAck(currentAdvertisedWindow(activeWs))
-          }
+          acceptInOrderAndDrainOoo(expected, payloadData, flags)
         } else if (isSeqAfter(parsed.tcpSeq, expected)) {
           val gap = (parsed.tcpSeq - expected) and 0xFFFFFFFFL
-          if (gap <= 262_144L && oooBuffer.size < MAX_OOO_SEGMENTS && !oooBuffer.containsKey(parsed.tcpSeq)) {
-            oooBuffer[parsed.tcpSeq] =
-              raw.copyOfRange(parsed.payloadOffset, parsed.payloadOffset + parsed.payloadLength)
+          if (gap <= MAX_OOO_GAP_BYTES &&
+            oooBuffer.size < MAX_OOO_SEGMENTS &&
+            !oooBuffer.containsKey(parsed.tcpSeq)
+          ) {
+            oooBuffer[parsed.tcpSeq] = payloadData
           }
           unackedClientBytes = 0
           sendAck(currentAdvertisedWindow(ws))
-        } else if (isSeqBefore(parsed.tcpSeq, expected)) {
-          unackedClientBytes = 0
-          sendAck(currentAdvertisedWindow(ws))
+        } else {
+          // Pure retransmit or partially overlapping retransmit
+          val segEnd = (parsed.tcpSeq + payloadData.size) and 0xFFFFFFFFL
+          if (isSeqAfter(segEnd, expected)) {
+            val overlapOffset = ((expected - parsed.tcpSeq) and 0xFFFFFFFFL).toInt()
+            if (overlapOffset in 1 until payloadData.size) {
+              val trimmed = payloadData.copyOfRange(overlapOffset, payloadData.size)
+              acceptInOrderAndDrainOoo(expected, trimmed, flags)
+            }
+          } else {
+            // Pure duplicate or Zero-Window probe ACK: answer immediately with current window
+            unackedClientBytes = 0
+            sendAck(currentAdvertisedWindow(ws))
+          }
+        }
+      } else if (payloadData.isEmpty() && zeroWindowAdvertised) {
+        val activeWs = ws
+        if (activeWs != null && activeWs.queueSize() <= WS_BACKPRESSURE_LOW_WATER_BYTES) {
+          zeroWindowAdvertised = false
+          sendAck(currentAdvertisedWindow(activeWs))
         }
       }
 
       if ((flags and Ipv4Packet.TCP_FIN) != 0 && !clientFinReceived) {
-        val finSeq = (parsed.tcpSeq + parsed.payloadLength) and 0xFFFFFFFFL
+        val finSeq = (parsed.tcpSeq + payloadData.size) and 0xFFFFFFFFL
         if (finSeq == clientNextSeq) {
           clientNextSeq = (finSeq + 1L) and 0xFFFFFFFFL
           clientFinReceived = true
           unackedClientBytes = 0
           sendAck(currentAdvertisedWindow(ws))
+          if (serverFinSent && state == State.CLOSING) {
+            // Both sides exchanged FIN; keep brief linger in CLOSING so late duplicate ACKs don't trigger RST
+            closingAtMs = System.currentTimeMillis()
+          }
         }
       }
     }
 
-    private fun processInOrderPayload(payload: ByteArray) {
-      clientNextSeq = (clientNextSeq + payload.size) and 0xFFFFFFFFL
-      txBytes.addAndGet(payload.size.toLong())
-      val activeWs = ws
-      synchronized(uploadLock) {
-        if (state == State.CLOSED) return
-        if (!initSent) {
-          pendingPreOpen.write(payload)
+    private fun acceptInOrderAndDrainOoo(
+      startSeq: Long,
+      initialChunk: ByteArray,
+      flags: Int,
+    ) {
+      val combined =
+        if (oooBuffer.isEmpty()) {
+          initialChunk
         } else {
+          val batch = ByteArrayOutputStream(initialChunk.size * 2)
+          batch.write(initialChunk)
+          var nextExpected = (startSeq + initialChunk.size) and 0xFFFFFFFFL
+          while (true) {
+            val seg = oooBuffer.remove(nextExpected) ?: break
+            batch.write(seg)
+            nextExpected = (nextExpected + seg.size) and 0xFFFFFFFFL
+          }
+          // Prune any stale/covered segments from oooBuffer
+          while (oooBuffer.isNotEmpty()) {
+            val firstEntry = oooBuffer.firstEntry() ?: break
+            val segEnd = (firstEntry.key + firstEntry.value.size) and 0xFFFFFFFFL
+            if (!isSeqAfter(segEnd, nextExpected)) {
+              oooBuffer.pollFirstEntry()
+            } else {
+              break
+            }
+          }
+          batch.toByteArray()
+        }
+
+      val accepted = processInOrderPayload(combined)
+      if (!accepted) return
+
+      unackedClientBytes += combined.size
+      val hasPsh = (flags and Ipv4Packet.TCP_PSH) != 0
+      val activeWs = ws
+      val congested = zeroWindowAdvertised || (activeWs != null && activeWs.queueSize() > WS_BACKPRESSURE_LOW_WATER_BYTES)
+      if (hasPsh || congested || unackedClientBytes >= mss * 2) {
+        unackedClientBytes = 0
+        sendAck(currentAdvertisedWindow(activeWs))
+      }
+    }
+
+    private fun processInOrderPayload(payload: ByteArray): Boolean {
+      val activeWs = ws
+      var accepted = false
+      var sendFailed = false
+      synchronized(uploadLock) {
+        if (state == State.CLOSED || state == State.CLOSING) return false
+        if (!initSent) {
+          if (pendingPreOpen.size() + payload.size > MAX_PRE_OPEN_HARD_CAP_BYTES) {
+            // Do not advance clientNextSeq and do not allocate unbounded memory; throttle via window=0
+            zeroWindowAdvertised = true
+            return false
+          }
+          pendingPreOpen.write(payload)
+          clientNextSeq = (clientNextSeq + payload.size) and 0xFFFFFFFFL
+          txBytes.addAndGet(payload.size.toLong())
+          accepted = true
+        } else {
+          val queued = activeWs?.queueSize() ?: 0L
+          if (queued >= WS_BACKPRESSURE_HIGH_WATER_BYTES) {
+            val now = System.currentTimeMillis()
+            if (now - lastBackpressureLogMs > 5_000L) {
+              lastBackpressureLogMs = now
+              vpnStateRepository.log(
+                LogLevel.WARN,
+                "TCP",
+                "Backpressure throttling $targetHost:${key.dstPort} (WS queue ${queued / 1024} KB)",
+              )
+            }
+          }
           WorkerProtocol.xorInPlace(payload, cryptoKey)
-          activeWs?.send(payload.toByteString())
+          val ok = activeWs?.send(payload.toByteString()) == true
+          if (!ok) {
+            sendFailed = true
+          } else {
+            clientNextSeq = (clientNextSeq + payload.size) and 0xFFFFFFFFL
+            txBytes.addAndGet(payload.size.toLong())
+            accepted = true
+          }
         }
       }
+
+      if (sendFailed) {
+        vpnStateRepository.log(
+          LogLevel.WARN,
+          "TCP",
+          "WebSocket send buffer rejected ${payload.size}B for $targetHost:${key.dstPort}; resetting TCP stream",
+        )
+        sendRstAck()
+        closeInternal()
+        return false
+      }
+      if (zeroWindowAdvertised) {
+        sendAck(0)
+      }
+      return accepted
     }
 
     private fun sendSynAck() {
@@ -298,7 +510,7 @@ class TcpSessionManager(
             ack = clientNextSeq,
             flags = Ipv4Packet.TCP_SYN or Ipv4Packet.TCP_ACK,
             window = 65535,
-            mss = MSS,
+            mss = mss,
             windowScale = if (negotiateWindowScale) SERVER_WINDOW_SCALE else null,
           )
         serverSeq = (serverSeq + 1L) and 0xFFFFFFFFL
@@ -331,7 +543,7 @@ class TcpSessionManager(
         val seqAck = clientNextSeq
         var off = 0
         while (off < data.size) {
-          val chunkLen = (data.size - off).coerceAtMost(MSS)
+          val chunkLen = (data.size - off).coerceAtMost(mss)
           val isLast = off + chunkLen >= data.size
           val flags =
             if (isLast) Ipv4Packet.TCP_PSH or Ipv4Packet.TCP_ACK
@@ -357,25 +569,6 @@ class TcpSessionManager(
       }
     }
 
-    private fun sendFinAck() {
-      synchronized(tunTxLock) {
-        if (state == State.CLOSED) return
-        val pkt =
-          Ipv4Packet.buildTcpPacket(
-            srcIp = key.dstIp,
-            dstIp = key.srcIp,
-            srcPort = key.dstPort,
-            dstPort = key.srcPort,
-            seq = serverSeq,
-            ack = clientNextSeq,
-            flags = Ipv4Packet.TCP_FIN or Ipv4Packet.TCP_ACK,
-            window = currentAdvertisedWindow(ws),
-          )
-        serverSeq = (serverSeq + 1L) and 0xFFFFFFFFL
-        writeToTun(pkt)
-      }
-    }
-
     private fun sendRstAck() {
       synchronized(tunTxLock) {
         val pkt =
@@ -387,6 +580,7 @@ class TcpSessionManager(
             seq = serverSeq,
             ack = clientNextSeq,
             flags = Ipv4Packet.TCP_RST or Ipv4Packet.TCP_ACK,
+            window = 0,
           )
         writeToTun(pkt)
       }
@@ -399,7 +593,7 @@ class TcpSessionManager(
         pendingPreOpen.reset()
         oooBuffer.clear()
       }
-      sessions.remove(key)
+      sessions.remove(key, this)
       runCatching { ws?.close(1000, "Session closed") }
       ws = null
     }
@@ -411,12 +605,44 @@ class TcpSessionManager(
 
   init {
     scope.launch(Dispatchers.IO) {
-      while (isActive) {
-        delay(15_000L)
+      while (isActive && !isShutdown) {
+        delay(2_000L)
         val now = System.currentTimeMillis()
         sessions.values.forEach { session ->
-          if (now - session.lastActivityMs > SESSION_IDLE_MS) {
+          val expired =
+            when {
+              session.state == State.CLOSING && session.closingAtMs > 0L ->
+                now - session.closingAtMs > CLOSING_LINGER_MS
+              session.clientFinReceived ->
+                now - session.lastActivityMs > HALF_CLOSED_IDLE_MS
+              else ->
+                now - session.lastActivityMs > SESSION_IDLE_MS
+            }
+          if (expired) {
             session.closeInternal()
+          } else if (session.zeroWindowAdvertised && session.state == State.ESTABLISHED) {
+            val activeWs = session.ws
+            if (activeWs != null && activeWs.queueSize() <= WS_BACKPRESSURE_LOW_WATER_BYTES) {
+              session.handleClientPacket(
+                Ipv4Packet.ParsedPacket(
+                  version = 4,
+                  protocol = Ipv4Packet.PROTO_TCP,
+                  ipHeaderLen = 20,
+                  totalLength = 40,
+                  srcIp = session.key.srcIp,
+                  dstIp = session.key.dstIp,
+                  srcPort = session.key.srcPort,
+                  dstPort = session.key.dstPort,
+                  tcpSeq = session.clientNextSeq,
+                  tcpAck = session.serverSeq,
+                  tcpFlags = Ipv4Packet.TCP_ACK,
+                  tcpWindow = 65535,
+                  payloadOffset = 40,
+                  payloadLength = 0,
+                ),
+                EMPTY_BYTES,
+              )
+            }
           }
         }
       }
@@ -428,13 +654,29 @@ class TcpSessionManager(
   fun handleTcpPacket(raw: ByteArray, parsed: Ipv4Packet.ParsedPacket) {
     if (isShutdown) return
     val key = TcpKey(parsed.srcIp, parsed.srcPort, parsed.dstIp, parsed.dstPort)
-    val packetCopy = raw.copyOfRange(0, parsed.totalLength)
-    val lane = workerLanes[(key.hashCode() and 0x7FFFFFFF) % threadCount]
+    val isSynOnly =
+      (parsed.tcpFlags and Ipv4Packet.TCP_SYN) != 0 &&
+        (parsed.tcpFlags and Ipv4Packet.TCP_ACK) == 0
 
+    // Avoid heap allocations for pure ACKs/FINs/RSTs; only copy TCP options on SYN or payload slice on data
+    val synHeaderSlice: ByteArray?
+    val payloadSlice: ByteArray
+    if (isSynOnly) {
+      synHeaderSlice = raw.copyOfRange(0, parsed.totalLength.coerceAtMost(raw.size))
+      payloadSlice = EMPTY_BYTES
+    } else if (parsed.payloadLength > 0 && parsed.payloadOffset + parsed.payloadLength <= raw.size) {
+      synHeaderSlice = null
+      payloadSlice = raw.copyOfRange(parsed.payloadOffset, parsed.payloadOffset + parsed.payloadLength)
+    } else {
+      synHeaderSlice = null
+      payloadSlice = EMPTY_BYTES
+    }
+
+    val lane = workerLanes[(key.hashCode() and 0x7FFFFFFF) % threadCount]
     runCatching {
       lane.execute {
         if (!isShutdown) {
-          processPacketOnLane(key, packetCopy, parsed)
+          processPacketOnLane(key, synHeaderSlice, payloadSlice, parsed, isSynOnly)
         }
       }
     }
@@ -442,18 +684,55 @@ class TcpSessionManager(
 
   private fun processPacketOnLane(
     key: TcpKey,
-    raw: ByteArray,
+    synHeaderSlice: ByteArray?,
+    payloadSlice: ByteArray,
     parsed: Ipv4Packet.ParsedPacket,
+    isSynOnly: Boolean,
   ) {
-    val isSynOnly =
-      (parsed.tcpFlags and Ipv4Packet.TCP_SYN) != 0 &&
-        (parsed.tcpFlags and Ipv4Packet.TCP_ACK) == 0
-
     if (isSynOnly) {
-      sessions.remove(key)?.closeInternal()
+      val existing = sessions[key]
+      if (existing != null &&
+        existing.state != State.CLOSED &&
+        existing.initialClientSeq == parsed.tcpSeq
+      ) {
+        // Kernel SYN retransmission during CONNECTING/OPEN: resend SYN-ACK without killing WebSocket
+        existing.retransmitSynAck()
+        return
+      }
+      if (existing != null) {
+        sessions.remove(key, existing)
+        existing.closeInternal()
+      }
+
       val dstStr = parsed.dstIpString
-      val targetHost = hostMapper.lookupDomainForIp(dstStr) ?: dstStr
-      val clientWs = Ipv4Packet.parseTcpWindowScale(raw, parsed)
+      val mappedDomain = hostMapper.lookupDomainForIp(dstStr)
+      val inSyntheticPool = VirtualHostMapper.isInSyntheticSubnet(parsed.dstIp)
+      if (dstStr == VirtualHostMapper.VIRTUAL_TUN_GATEWAY_IP ||
+        (inSyntheticPool && (mappedDomain == null || !VirtualHostMapper.isValidSyntheticIp(dstStr)))
+      ) {
+        vpnStateRepository.log(
+          LogLevel.WARN,
+          "TCP",
+          "Rejected unmapped/invalid synthetic TCP target $dstStr:${parsed.dstPort}",
+        )
+        val rst =
+          Ipv4Packet.buildTcpPacket(
+            srcIp = parsed.dstIp,
+            dstIp = parsed.srcIp,
+            srcPort = parsed.dstPort,
+            dstPort = parsed.srcPort,
+            seq = 0L,
+            ack = (parsed.tcpSeq + 1L) and 0xFFFFFFFFL,
+            flags = Ipv4Packet.TCP_RST or Ipv4Packet.TCP_ACK,
+            window = 0,
+          )
+        writeToTun(rst)
+        return
+      }
+
+      val targetHost = mappedDomain ?: dstStr
+      val clientWs =
+        if (synHeaderSlice != null) Ipv4Packet.parseTcpWindowScale(synHeaderSlice, parsed) else null
       val session = TcpSession(key, targetHost, parsed.tcpSeq, negotiateWindowScale = clientWs != null)
       sessions[key] = session
       if (vpnStateRepository.wantsTrafficLog()) {
@@ -469,7 +748,7 @@ class TcpSessionManager(
 
     val existing = sessions[key]
     if (existing != null) {
-      existing.handleClientPacket(raw, parsed)
+      existing.handleClientPacket(parsed, payloadSlice)
     } else if ((parsed.tcpFlags and Ipv4Packet.TCP_RST) == 0) {
       val rst =
         Ipv4Packet.buildTcpPacket(
@@ -478,8 +757,9 @@ class TcpSessionManager(
           srcPort = parsed.dstPort,
           dstPort = parsed.srcPort,
           seq = parsed.tcpAck,
-          ack = (parsed.tcpSeq + parsed.payloadLength + 1L) and 0xFFFFFFFFL,
+          ack = (parsed.tcpSeq + parsed.payloadLength + if ((parsed.tcpFlags and Ipv4Packet.TCP_FIN) != 0) 1L else 0L) and 0xFFFFFFFFL,
           flags = Ipv4Packet.TCP_RST or Ipv4Packet.TCP_ACK,
+          window = 0,
         )
       writeToTun(rst)
     }
@@ -490,17 +770,10 @@ class TcpSessionManager(
     sessions.values.toList().forEach { it.closeInternal() }
     sessions.clear()
     for (lane in workerLanes) {
-      runCatching { lane.shutdownNow() }
+      runCatching {
+        lane.shutdownNow()
+        lane.awaitTermination(200L, TimeUnit.MILLISECONDS)
+      }
     }
-  }
-
-  private fun isSeqBefore(a: Long, b: Long): Boolean {
-    val diff = ((a - b) and 0xFFFFFFFFL).toInt()
-    return diff < 0
-  }
-
-  private fun isSeqAfter(a: Long, b: Long): Boolean {
-    val diff = ((a - b) and 0xFFFFFFFFL).toInt()
-    return diff > 0
   }
 }

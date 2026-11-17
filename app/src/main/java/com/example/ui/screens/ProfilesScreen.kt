@@ -421,7 +421,7 @@ private fun ProfileCard(
               overflow = TextOverflow.Ellipsis,
             )
             Text(
-              text = "Clean IP: ${profile.cleanIp.ifBlank { "Required (Zero-DNS)" }}",
+              text = "Clean IP: ${profile.cleanIp.ifBlank { "Direct Worker URL" }}",
               style = MaterialTheme.typography.labelSmall,
               color = MaterialTheme.colorScheme.secondary,
               maxLines = 1,

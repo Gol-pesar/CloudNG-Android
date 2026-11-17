@@ -190,6 +190,7 @@ fun EdgeTunnelRoot(viewModel: MainViewModel) {
 
   fun startOrStopVpn() {
     val currentStatus = telemetry.status
+    if (currentStatus is VpnStatus.Disconnecting) return
     if (currentStatus is VpnStatus.Connected || currentStatus is VpnStatus.Connecting) {
       WorkerVpnService.stopVpn(context)
       return

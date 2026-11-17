@@ -33,89 +33,132 @@ object Ipv4Packet {
     val dstIpString: String get() = WorkerProtocol.ipv4IntToString(dstIp)
   }
 
-  fun parse(buf: ByteArray, length: Int): ParsedPacket? {
-    if (length < 20) return null
+  fun peekIpVersion(buf: ByteArray, length: Int): Int {
+    if (length < 1 || buf.isEmpty()) return -1
+    return (buf[0].toInt() ushr 4) and 0x0F
+  }
+
+  fun peekIpv6NextHeader(buf: ByteArray, length: Int): Int {
+    if (length < 40 || buf.size < 40) return -1
+    if (peekIpVersion(buf, length) != 6) return -1
+    return buf[6].toInt() and 0xFF
+  }
+
+  fun verifyIpv4HeaderChecksum(buf: ByteArray, ihl: Int): Boolean {
+    if (ihl < 20 || buf.size < ihl) return false
+    return ipChecksum(buf, 0, ihl) == 0
+  }
+
+  fun verifyTransportChecksum(buf: ByteArray, parsed: ParsedPacket): Boolean {
+    val transportOffset = parsed.ipHeaderLen
+    val transportLen = parsed.totalLength - transportOffset
+    if (transportOffset < 20 || transportLen <= 0 || parsed.totalLength > buf.size) return false
+    return when (parsed.protocol) {
+      PROTO_TCP -> {
+        if (transportLen < 20) return false
+        transportChecksum(parsed.srcIp, parsed.dstIp, PROTO_TCP, buf, transportOffset, transportLen) == 0
+      }
+      PROTO_UDP -> {
+        if (transportLen < 8) return false
+        val udpChecksumField = readU16(buf, transportOffset + 6)
+        if (udpChecksumField == 0) return true // Optional in IPv4 UDP (RFC 768)
+        transportChecksum(parsed.srcIp, parsed.dstIp, PROTO_UDP, buf, transportOffset, transportLen) == 0
+      }
+      else -> true
+    }
+  }
+
+  fun parse(buf: ByteArray, length: Int, validateChecksums: Boolean = true): ParsedPacket? {
+    if (length < 20 || length > buf.size) return null
     val version = (buf[0].toInt() ushr 4) and 0x0F
     if (version != 4) return null
     val ihl = (buf[0].toInt() and 0x0F) * 4
     if (ihl < 20 || length < ihl) return null
-    val totalLength = readU16(buf, 2).coerceAtMost(length)
+    val declaredTotalLength = readU16(buf, 2)
+    if (declaredTotalLength < ihl || declaredTotalLength > length) return null
+    if (validateChecksums && !verifyIpv4HeaderChecksum(buf, ihl)) return null
+
     val protocol = buf[9].toInt() and 0xFF
     val srcIp = readI32(buf, 12)
     val dstIp = readI32(buf, 16)
 
-    return when (protocol) {
-      PROTO_TCP -> {
-        if (totalLength < ihl + 20) return null
-        val srcPort = readU16(buf, ihl)
-        val dstPort = readU16(buf, ihl + 2)
-        val seq = readU32(buf, ihl + 4)
-        val ack = readU32(buf, ihl + 8)
-        val dataOffset = ((buf[ihl + 12].toInt() ushr 4) and 0x0F) * 4
-        if (dataOffset < 20 || totalLength < ihl + dataOffset) return null
-        val flags = buf[ihl + 13].toInt() and 0x3F
-        val window = readU16(buf, ihl + 14)
-        val payloadOffset = ihl + dataOffset
-        val payloadLength = (totalLength - payloadOffset).coerceAtLeast(0)
-        ParsedPacket(
-          version = 4,
-          protocol = protocol,
-          ipHeaderLen = ihl,
-          totalLength = totalLength,
-          srcIp = srcIp,
-          dstIp = dstIp,
-          srcPort = srcPort,
-          dstPort = dstPort,
-          tcpSeq = seq,
-          tcpAck = ack,
-          tcpFlags = flags,
-          tcpWindow = window,
-          payloadOffset = payloadOffset,
-          payloadLength = payloadLength,
-        )
+    val parsed =
+      when (protocol) {
+        PROTO_TCP -> {
+          if (declaredTotalLength < ihl + 20) return null
+          val srcPort = readU16(buf, ihl)
+          val dstPort = readU16(buf, ihl + 2)
+          val seq = readU32(buf, ihl + 4)
+          val ack = readU32(buf, ihl + 8)
+          val dataOffset = ((buf[ihl + 12].toInt() ushr 4) and 0x0F) * 4
+          if (dataOffset < 20 || declaredTotalLength < ihl + dataOffset) return null
+          val flags = buf[ihl + 13].toInt() and 0x3F
+          val window = readU16(buf, ihl + 14)
+          val payloadOffset = ihl + dataOffset
+          val payloadLength = declaredTotalLength - payloadOffset
+          ParsedPacket(
+            version = 4,
+            protocol = protocol,
+            ipHeaderLen = ihl,
+            totalLength = declaredTotalLength,
+            srcIp = srcIp,
+            dstIp = dstIp,
+            srcPort = srcPort,
+            dstPort = dstPort,
+            tcpSeq = seq,
+            tcpAck = ack,
+            tcpFlags = flags,
+            tcpWindow = window,
+            payloadOffset = payloadOffset,
+            payloadLength = payloadLength,
+          )
+        }
+        PROTO_UDP -> {
+          if (declaredTotalLength < ihl + 8) return null
+          val srcPort = readU16(buf, ihl)
+          val dstPort = readU16(buf, ihl + 2)
+          val udpLen = readU16(buf, ihl + 4)
+          if (udpLen < 8 || ihl + udpLen > declaredTotalLength) return null
+          val payloadOffset = ihl + 8
+          val payloadLength = udpLen - 8
+          ParsedPacket(
+            version = 4,
+            protocol = protocol,
+            ipHeaderLen = ihl,
+            totalLength = declaredTotalLength,
+            srcIp = srcIp,
+            dstIp = dstIp,
+            srcPort = srcPort,
+            dstPort = dstPort,
+            tcpSeq = 0L,
+            tcpAck = 0L,
+            tcpFlags = 0,
+            tcpWindow = 0,
+            payloadOffset = payloadOffset,
+            payloadLength = payloadLength,
+          )
+        }
+        else ->
+          ParsedPacket(
+            version = 4,
+            protocol = protocol,
+            ipHeaderLen = ihl,
+            totalLength = declaredTotalLength,
+            srcIp = srcIp,
+            dstIp = dstIp,
+            srcPort = 0,
+            dstPort = 0,
+            tcpSeq = 0L,
+            tcpAck = 0L,
+            tcpFlags = 0,
+            tcpWindow = 0,
+            payloadOffset = ihl,
+            payloadLength = declaredTotalLength - ihl,
+          )
       }
-      PROTO_UDP -> {
-        if (totalLength < ihl + 8) return null
-        val srcPort = readU16(buf, ihl)
-        val dstPort = readU16(buf, ihl + 2)
-        val udpLen = readU16(buf, ihl + 4)
-        val payloadOffset = ihl + 8
-        val payloadLength = (udpLen - 8).coerceIn(0, (totalLength - payloadOffset).coerceAtLeast(0))
-        ParsedPacket(
-          version = 4,
-          protocol = protocol,
-          ipHeaderLen = ihl,
-          totalLength = totalLength,
-          srcIp = srcIp,
-          dstIp = dstIp,
-          srcPort = srcPort,
-          dstPort = dstPort,
-          tcpSeq = 0L,
-          tcpAck = 0L,
-          tcpFlags = 0,
-          tcpWindow = 0,
-          payloadOffset = payloadOffset,
-          payloadLength = payloadLength,
-        )
-      }
-      else ->
-        ParsedPacket(
-          version = 4,
-          protocol = protocol,
-          ipHeaderLen = ihl,
-          totalLength = totalLength,
-          srcIp = srcIp,
-          dstIp = dstIp,
-          srcPort = 0,
-          dstPort = 0,
-          tcpSeq = 0L,
-          tcpAck = 0L,
-          tcpFlags = 0,
-          tcpWindow = 0,
-          payloadOffset = ihl,
-          payloadLength = (totalLength - ihl).coerceAtLeast(0),
-        )
-    }
+
+    if (validateChecksums && !verifyTransportChecksum(buf, parsed)) return null
+    return parsed
   }
 
   fun buildUdpPacket(
@@ -229,7 +272,8 @@ object Ipv4Packet {
     origLen: Int,
     parsed: ParsedPacket,
   ): ByteArray {
-    val quotedLen = (parsed.ipHeaderLen + 8).coerceAtMost(origLen)
+    val safeOrigLen = origLen.coerceIn(0, origRaw.size)
+    val quotedLen = (parsed.ipHeaderLen + 8).coerceIn(0, safeOrigLen)
     val icmpLen = 8 + quotedLen
     val totalLen = 20 + icmpLen
     val pkt = ByteArray(totalLen)

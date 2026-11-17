@@ -277,10 +277,12 @@ class MainViewModel(
       _draft.update { it.copy(validationError = uuidRequiredMsg) }
       return false
     }
-    val parsedCleanIp = WorkerProtocol.parseCleanIp(cur.cleanIp)
-    if (WorkerProtocol.resolveTargetIp(parsedUrl, parsedCleanIp) == null) {
-      _draft.update { it.copy(validationError = cleanIpRequiredMsg) }
-      return false
+    if (cur.cleanIp.isNotBlank()) {
+      val parsedCleanIp = WorkerProtocol.parseCleanIp(cur.cleanIp)
+      if (parsedCleanIp == null || !WorkerProtocol.isIpLiteral(parsedCleanIp.host)) {
+        _draft.update { it.copy(validationError = cleanIpRequiredMsg) }
+        return false
+      }
     }
     val saved =
       configRepo.updateActiveFields(
@@ -308,10 +310,12 @@ class MainViewModel(
       _draft.update { it.copy(validationError = uuidRequiredMsg) }
       return
     }
-    val parsedCleanIp = WorkerProtocol.parseCleanIp(cur.cleanIp)
-    if (WorkerProtocol.resolveTargetIp(parsedUrl, parsedCleanIp) == null) {
-      _draft.update { it.copy(validationError = cleanIpRequiredMsg) }
-      return
+    if (cur.cleanIp.isNotBlank()) {
+      val parsedCleanIp = WorkerProtocol.parseCleanIp(cur.cleanIp)
+      if (parsedCleanIp == null || !WorkerProtocol.isIpLiteral(parsedCleanIp.host)) {
+        _draft.update { it.copy(validationError = cleanIpRequiredMsg) }
+        return
+      }
     }
     viewModelScope.launch {
       val saved = configRepo.updateActiveFields(cur.workerUrl, cur.uuid, cur.cleanIp)

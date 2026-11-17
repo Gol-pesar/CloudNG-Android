@@ -15,7 +15,6 @@ import android.net.NetworkRequest
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
-import android.os.Process
 import androidx.core.app.NotificationCompat
 import com.example.EdgeTunnelApp
 import com.example.MainActivity
@@ -36,17 +35,33 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withTimeout
+import okhttp3.Call
+import okhttp3.Connection
+import okhttp3.EventListener
+import okhttp3.Handshake
 import okhttp3.OkHttpClient
+import okhttp3.Protocol
+import okhttp3.Response
+import okhttp3.WebSocket
+import okhttp3.WebSocketListener
+import okio.ByteString
+import okio.ByteString.Companion.toByteString
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.io.IOException
 import java.net.InetAddress
 import java.net.InetSocketAddress
+import java.net.Proxy
 import java.net.Socket
-import java.net.UnknownHostException
 import java.nio.ByteBuffer
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 import javax.net.SocketFactory
+import kotlin.coroutines.resume
 
 class WorkerVpnService : VpnService() {
 
@@ -56,6 +71,7 @@ class WorkerVpnService : VpnService() {
     const val ACTION_RESTART_IF_RUNNING = "com.example.vpn.RESTART_IF_RUNNING"
     private const val NOTIFICATION_ID = 4102
     private const val CHANNEL_ID = "edgetunnel_vpn_channel"
+    private const val OUTBOUND_QUEUE_CAPACITY = 2048
 
     fun startVpn(context: Context) {
       val intent = Intent(context, WorkerVpnService::class.java).apply { action = ACTION_START }
@@ -84,16 +100,27 @@ class WorkerVpnService : VpnService() {
   private val stateRepo get() = appContainer.vpnStateRepository
   private val configRepo get() = appContainer.configRepository
 
-  private var serviceScope: CoroutineScope? = null
-  private var tunInterface: ParcelFileDescriptor? = null
-  private var sharedWorkerClient: OkHttpClient? = null
-  private var hostMapper: VirtualHostMapper? = null
-  private var tcpManager: TcpSessionManager? = null
+  private val engineLock = Any()
+  private val connectionAttemptSeq = AtomicLong(0L)
+  @Volatile private var serviceScope: CoroutineScope? = null
+  @Volatile private var tunInterface: ParcelFileDescriptor? = null
+  @Volatile private var sharedWorkerClient: OkHttpClient? = null
+  @Volatile private var hostMapper: VirtualHostMapper? = null
+  @Volatile private var tcpManager: TcpSessionManager? = null
   private var connectivityManager: ConnectivityManager? = null
-  private var underlyingCallback: ConnectivityManager.NetworkCallback? = null
+  @Volatile private var underlyingCallback: ConnectivityManager.NetworkCallback? = null
   @Volatile private var underlyingNetwork: Network? = null
   @Volatile private var tunnelActive: Boolean = false
-  private val outboundQueue = ArrayBlockingQueue<ByteArray>(32768)
+
+  private val outboundQueue = ArrayBlockingQueue<ByteArray>(OUTBOUND_QUEUE_CAPACITY)
+  private val ipv6DropCount = AtomicLong(0L)
+  private val malformedDropCount = AtomicLong(0L)
+  private val tunWriteDropCount = AtomicLong(0L)
+  @Volatile private var lastIpv6WarnMs = 0L
+  @Volatile private var lastMalformedWarnMs = 0L
+  @Volatile private var lastUdpLogMs = 0L
+  @Volatile private var lastQueueWarnMs = 0L
+  @Volatile private var lastProtectWarnMs = 0L
 
   override fun onCreate() {
     super.onCreate()
@@ -136,12 +163,15 @@ class WorkerVpnService : VpnService() {
   }
 
   private fun startTunnel() {
-    cleanupEngine()
-    tunnelActive = true
-    registerUnderlyingNetworkMonitor()
-
-    val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    serviceScope = scope
+    val attemptId: Long
+    val scope: CoroutineScope
+    synchronized(engineLock) {
+      attemptId = connectionAttemptSeq.incrementAndGet()
+      cleanupEngineLocked()
+      tunnelActive = true
+      scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+      serviceScope = scope
+    }
 
     scope.launch {
       val config: VpnConfig? = configRepo.getActiveConfig()
@@ -149,130 +179,228 @@ class WorkerVpnService : VpnService() {
       val parsedUrl = config?.let { WorkerProtocol.parseWorkerUrl(it.workerUrl) }
 
       if (config == null || parsedUrl == null || config.uuid.isBlank()) {
-        val errMsg = "Worker URL and UUID are required"
-        stateRepo.log(LogLevel.ERROR, "VPN", errMsg)
-        stateRepo.updateStatus(VpnStatus.Error(errMsg))
-        tunnelActive = false
-        stopSelf()
+        failStartup(attemptId, "Worker URL and UUID are required")
         return@launch
       }
 
+      if (attemptId != connectionAttemptSeq.get() || !tunnelActive) return@launch
+
       val cleanIp = WorkerProtocol.parseCleanIp(config.cleanIp)
-      val targetIp = WorkerProtocol.resolveTargetIp(parsedUrl, cleanIp)
-      if (targetIp == null) {
-        val errMsg = "Clean IP (IPv4/IPv6) is required — DNS is disabled"
-        stateRepo.log(LogLevel.ERROR, "VPN", errMsg)
-        stateRepo.updateStatus(VpnStatus.Error(errMsg))
-        tunnelActive = false
-        stopSelf()
-        return@launch
-      }
+      val initialTargetLabel = cleanIp?.host ?: parsedUrl.host
 
       stateRepo.updateStatus(
         status = VpnStatus.Connecting,
         workerHost = parsedUrl.host,
-        cleanIp = targetIp,
+        cleanIp = initialTargetLabel,
       )
       stateRepo.log(
         LogLevel.INFO,
         "VPN",
-        "Starting tunnel → ${parsedUrl.host} (Direct IP: $targetIp, Zero-DNS)",
+        "[1/6] Service ready (token ${WorkerProtocol.maskUuid(config.uuid)}, target ${parsedUrl.host})",
       )
 
+      // 2. Establish TUN interface before probing sockets so OS VPN routing & self-bypass are bound cleanly
+      registerUnderlyingNetworkMonitor()
       val pfd =
         try {
           establishTunInterface(settings, config.mtu)
         } catch (e: Exception) {
-          val msg = "TUN establish failed: ${e.message}"
-          stateRepo.log(LogLevel.ERROR, "VPN", msg)
-          stateRepo.updateStatus(VpnStatus.Error(msg))
-          tunnelActive = false
-          stopSelf()
+          failStartup(attemptId, "TUN establish failed: ${e.message}")
           return@launch
         }
 
       if (pfd == null) {
-        val msg = "VPN interface not authorized"
-        stateRepo.log(LogLevel.ERROR, "VPN", msg)
-        stateRepo.updateStatus(VpnStatus.Error(msg))
-        tunnelActive = false
-        stopSelf()
+        failStartup(attemptId, "VPN permission missing or TUN interface rejected")
         return@launch
       }
-      tunInterface = pfd
 
-      val protectedFactory = createProtectedSocketFactory()
+      synchronized(engineLock) {
+        if (attemptId != connectionAttemptSeq.get() || !tunnelActive) {
+          runCatching { pfd.close() }
+          return@launch
+        }
+        tunInterface = pfd
+      }
+      stateRepo.log(
+        LogLevel.INFO,
+        "VPN",
+        "[2/6] TUN interface established (MTU ${config.mtu}, 10.0.0.2/32, per-app=${settings.perAppMode.key})",
+      )
+
+      // 3. Initialize Worker engine components (socket factory, mapper, concurrency)
       val workerThreads =
         settings.workerThreads.coerceIn(RamThreadGuide.MIN_THREADS, RamThreadGuide.MAX_THREADS)
-
-      val workerClient =
-        WorkerProtocol.createWorkerOkHttpClient(
-          workerHost = parsedUrl.host,
-          cleanIp = cleanIp,
-          socketFactory = protectedFactory,
-          connectTimeoutSec = 6L,
-          workerThreads = workerThreads,
-        )
-      sharedWorkerClient = workerClient
-
-      // Pre-warm TLS 1.3 session tickets & multiple concurrent Worker isolates in parallel
-      val prewarmCount = workerThreads.coerceIn(2, 10)
-      for (idx in 0 until prewarmCount) {
-        scope.launch(Dispatchers.IO) {
-          prewarmWorkerTls(workerClient, parsedUrl, cleanIp, logResult = idx == 0)
-        }
-      }
+      val protectedFactory = createProtectedSocketFactory()
+      val netLabel = describeUnderlyingNetwork(connectivityManager, underlyingNetwork)
+      stateRepo.log(
+        LogLevel.INFO,
+        "VPN",
+        "[3/6] Engine initialized (net=$netLabel, lanes=$workerThreads, self-bypass=true)",
+      )
 
       val enqueueToTun: (ByteArray) -> Unit = { pkt ->
-        if (tunnelActive) {
-          if (!outboundQueue.offer(pkt)) {
-            runCatching { outboundQueue.offer(pkt, 200L, TimeUnit.MILLISECONDS) }
+        if (tunnelActive && attemptId == connectionAttemptSeq.get()) {
+          val offered = outboundQueue.offer(pkt)
+          if (!offered) {
+            val delayed = runCatching { outboundQueue.offer(pkt, 50L, TimeUnit.MILLISECONDS) }.getOrDefault(false)
+            if (!delayed) {
+              val dropped = tunWriteDropCount.incrementAndGet()
+              val now = System.currentTimeMillis()
+              if (now - lastQueueWarnMs > 5_000L) {
+                lastQueueWarnMs = now
+                stateRepo.log(LogLevel.WARN, "TUN", "Outbound TUN queue saturated (dropped=$dropped)")
+              }
+            }
           }
         }
       }
 
-      val mapper = VirtualHostMapper()
-      hostMapper = mapper
+      val mapper =
+        VirtualHostMapper { level, msg ->
+          stateRepo.log(level, "DNS", msg)
+        }
+
+      // 4-6. Real WebSocket connection (chat.v2), custom init frame, and Worker ACK verification
+      var effectiveCleanIp: ParsedCleanIp? = cleanIp
+      var workerClient: OkHttpClient? = null
+      var activeRouteLabel = initialTargetLabel
+      var lastProbeError: String? = null
+
+      val probeListenerFactory = createDiagnosticEventListenerFactory(logVerboseEvents = true)
+      val runtimeListenerFactory = createDiagnosticEventListenerFactory(logVerboseEvents = false)
+
+      if (cleanIp != null) {
+        stateRepo.log(
+          LogLevel.INFO,
+          "VPN",
+          "[4/6] Connecting via Clean IP ${cleanIp.host}:${cleanIp.port ?: parsedUrl.port} (Zero-DNS, SNI=${parsedUrl.host})…",
+        )
+        val probeCleanClient =
+          WorkerProtocol.createWorkerOkHttpClient(
+            workerHost = parsedUrl.host,
+            cleanIp = cleanIp,
+            socketFactory = protectedFactory,
+            connectTimeoutSec = 8L,
+            workerThreads = 2,
+            eventListenerFactory = probeListenerFactory,
+          )
+        val pinnedErr = probeWorkerHandshake(probeCleanClient, parsedUrl, cleanIp, config.uuid)
+        shutdownOkHttpClient(probeCleanClient)
+
+        if (pinnedErr == null) {
+          workerClient =
+            WorkerProtocol.createWorkerOkHttpClient(
+              workerHost = parsedUrl.host,
+              cleanIp = cleanIp,
+              socketFactory = protectedFactory,
+              connectTimeoutSec = 10L,
+              workerThreads = workerThreads,
+              eventListenerFactory = runtimeListenerFactory,
+            )
+          activeRouteLabel = cleanIp.host
+          stateRepo.log(LogLevel.INFO, "VPN", "[5/6] Worker ACK verified via Clean IP ${cleanIp.host}")
+        } else {
+          lastProbeError = pinnedErr
+          stateRepo.log(
+            LogLevel.WARN,
+            "VPN",
+            "Clean IP ${cleanIp.host} failed ($pinnedErr); falling back to ${parsedUrl.host} (IPv6-first)…",
+          )
+        }
+      }
+
+      if (workerClient == null) {
+        if (attemptId != connectionAttemptSeq.get() || !tunnelActive) return@launch
+        stateRepo.log(
+          LogLevel.INFO,
+          "VPN",
+          "[4/6] Connecting direct → ${parsedUrl.host}:${parsedUrl.port}…",
+        )
+        val probeFallbackClient =
+          WorkerProtocol.createWorkerOkHttpClient(
+            workerHost = parsedUrl.host,
+            cleanIp = null,
+            socketFactory = protectedFactory,
+            connectTimeoutSec = 10L,
+            workerThreads = 2,
+            preferIpv6Fallback = cleanIp != null,
+            eventListenerFactory = probeListenerFactory,
+          )
+        val fallbackErr = probeWorkerHandshake(probeFallbackClient, parsedUrl, null, config.uuid)
+        shutdownOkHttpClient(probeFallbackClient)
+
+        if (fallbackErr == null) {
+          workerClient =
+            WorkerProtocol.createWorkerOkHttpClient(
+              workerHost = parsedUrl.host,
+              cleanIp = null,
+              socketFactory = protectedFactory,
+              connectTimeoutSec = 12L,
+              workerThreads = workerThreads,
+              preferIpv6Fallback = cleanIp != null,
+              eventListenerFactory = runtimeListenerFactory,
+            )
+          effectiveCleanIp = null
+          activeRouteLabel =
+            if (cleanIp != null) "${parsedUrl.host} (Direct Fallback)"
+            else "${parsedUrl.host} (Direct)"
+          stateRepo.log(LogLevel.INFO, "VPN", "[5/6] Worker ACK verified via $activeRouteLabel")
+        } else {
+          val combinedErr =
+            if (lastProbeError != null) "Clean IP: $lastProbeError | Fallback: $fallbackErr"
+            else fallbackErr
+          failStartup(attemptId, "Handshake failed: $combinedErr")
+          return@launch
+        }
+      }
 
       val tcp =
         TcpSessionManager(
           scope = scope,
           parsedWorkerUrl = parsedUrl,
           uuid = config.uuid,
-          cleanIp = cleanIp,
+          cleanIp = effectiveCleanIp,
           sharedWorkerClient = workerClient,
           hostMapper = mapper,
           vpnStateRepository = stateRepo,
           workerThreads = workerThreads,
+          tunMtu = config.mtu,
           writeToTun = enqueueToTun,
         )
-      tcpManager = tcp
 
+      synchronized(engineLock) {
+        if (attemptId != connectionAttemptSeq.get() || !tunnelActive) {
+          tcp.shutdown()
+          mapper.clear()
+          shutdownOkHttpClient(workerClient)
+          return@launch
+        }
+        sharedWorkerClient = workerClient
+        hostMapper = mapper
+        tcpManager = tcp
+      }
+
+      // 7. Report Connected ONLY after TUN + Engine + Real WS + Init + ACK verification succeeded
       stateRepo.updateStatus(
         status = VpnStatus.Connected,
         workerHost = parsedUrl.host,
-        cleanIp = targetIp,
+        cleanIp = activeRouteLabel,
       )
-      val subtitle = "${parsedUrl.host} • $targetIp"
+      val subtitle = "${parsedUrl.host} • $activeRouteLabel"
       promoteToForeground(getString(R.string.vpn_notif_connected_title), subtitle)
-      stateRepo.log(
-        LogLevel.INFO,
-        "VPN",
-        "TUN ready (MTU ${config.mtu}, ${workerThreads}T workers, self-bypass active, per-app=${settings.perAppMode.key})",
-      )
+      stateRepo.log(LogLevel.INFO, "VPN", "[6/6] Connected: $subtitle")
 
-      // High-priority TUN writer loop
+      // TUN writer loop
       scope.launch(Dispatchers.IO) {
-        runCatching { Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO) }
         val out = FileOutputStream(pfd.fileDescriptor)
         try {
-          while (isActive) {
-            val pkt = outboundQueue.take()
+          while (isActive && tunnelActive && attemptId == connectionAttemptSeq.get()) {
+            val pkt = outboundQueue.poll(250L, TimeUnit.MILLISECONDS) ?: continue
             out.write(pkt)
           }
         } catch (_: InterruptedException) {
         } catch (e: Exception) {
-          if (isActive) {
+          if (isActive && tunnelActive && attemptId == connectionAttemptSeq.get()) {
             stateRepo.log(LogLevel.ERROR, "TUN", "Write error: ${e.message}")
           }
         }
@@ -282,7 +410,7 @@ class WorkerVpnService : VpnService() {
       scope.launch(Dispatchers.IO) {
         var lastTx = 0L
         var lastRx = 0L
-        while (isActive) {
+        while (isActive && tunnelActive && attemptId == connectionAttemptSeq.get()) {
           delay(1_000L)
           val tx = tcp.txBytes.get()
           val rx = tcp.rxBytes.get()
@@ -300,17 +428,41 @@ class WorkerVpnService : VpnService() {
         }
       }
 
-      // High-priority TUN reader loop
-      runCatching { Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO) }
+      // TUN reader loop (reusable read buffer)
       val input = FileInputStream(pfd.fileDescriptor)
       val readBuffer = ByteBuffer.allocate(32767)
       try {
-        while (isActive) {
+        while (isActive && tunnelActive && attemptId == connectionAttemptSeq.get()) {
           val len = input.read(readBuffer.array())
           if (len < 0) break
           if (len == 0) continue
           val packetBytes = readBuffer.array()
-          val parsed = Ipv4Packet.parse(packetBytes, len) ?: continue
+          val ipVersion = Ipv4Packet.peekIpVersion(packetBytes, len)
+          if (ipVersion == 6) {
+            val dropped = ipv6DropCount.incrementAndGet()
+            val now = System.currentTimeMillis()
+            if (now - lastIpv6WarnMs > 10_000L) {
+              lastIpv6WarnMs = now
+              val nextHdr = Ipv4Packet.peekIpv6NextHeader(packetBytes, len)
+              stateRepo.log(
+                LogLevel.WARN,
+                "TUN",
+                "IPv6 packet skipped on IPv4-only TUN (total=$dropped, nextHdr=$nextHdr)",
+              )
+            }
+            continue
+          }
+          if (ipVersion != 4) {
+            logMalformedPacket(ipVersion, len)
+            continue
+          }
+
+          val parsed = Ipv4Packet.parse(packetBytes, len)
+          if (parsed == null) {
+            logMalformedPacket(ipVersion, len)
+            continue
+          }
+
           when (parsed.protocol) {
             Ipv4Packet.PROTO_TCP -> tcp.handleTcpPacket(packetBytes, parsed)
             Ipv4Packet.PROTO_UDP -> {
@@ -318,18 +470,126 @@ class WorkerVpnService : VpnService() {
                 mapper.handleQueryPacket(packetBytes, parsed)?.let(enqueueToTun)
               } else {
                 // Force non-53 UDP (e.g. QUIC) to fall back immediately to TCP
+                val now = System.currentTimeMillis()
+                if (now - lastUdpLogMs > 5_000L) {
+                  lastUdpLogMs = now
+                  stateRepo.log(
+                    LogLevel.TRAFFIC,
+                    "UDP",
+                    "Non-DNS UDP port ${parsed.dstPort} rejected (ICMP Unreachable → TCP fallback)",
+                  )
+                }
                 enqueueToTun(Ipv4Packet.buildIcmpPortUnreachable(packetBytes, len, parsed))
               }
             }
           }
         }
       } catch (e: Exception) {
-        if (isActive) {
+        if (isActive && tunnelActive && attemptId == connectionAttemptSeq.get()) {
           stateRepo.log(LogLevel.ERROR, "TUN", "Read error: ${e.message}")
         }
       } finally {
-        if (isActive) {
+        if (attemptId == connectionAttemptSeq.get() && tunnelActive) {
           stopTunnel()
+        }
+      }
+    }
+  }
+
+  private fun failStartup(attemptId: Long, errorMsg: String) {
+    synchronized(engineLock) {
+      if (attemptId != connectionAttemptSeq.get()) return
+      tunnelActive = false
+      cleanupEngineLocked()
+    }
+    stateRepo.log(LogLevel.ERROR, "VPN", errorMsg)
+    stateRepo.updateStatus(VpnStatus.Error(errorMsg))
+    removeForegroundCompat()
+    stopSelf()
+  }
+
+  private fun logMalformedPacket(version: Int, len: Int) {
+    val count = malformedDropCount.incrementAndGet()
+    val now = System.currentTimeMillis()
+    if (now - lastMalformedWarnMs > 10_000L) {
+      lastMalformedWarnMs = now
+      stateRepo.log(
+        LogLevel.WARN,
+        "TUN",
+        "Dropped malformed/bad-checksum IP packet (ver=$version, len=$len, count=$count)",
+      )
+    }
+  }
+
+  private fun createDiagnosticEventListenerFactory(logVerboseEvents: Boolean): EventListener.Factory {
+    return EventListener.Factory {
+      object : EventListener() {
+        @Volatile private var tcpStartMs = 0L
+        @Volatile private var tlsStartMs = 0L
+        @Volatile private var lastSocketLabel = ""
+
+        override fun dnsEnd(call: Call, domainName: String, inetAddressList: List<InetAddress>) {
+          if (logVerboseEvents && inetAddressList.isNotEmpty()) {
+            val ips = inetAddressList.joinToString(", ") { it.hostAddress ?: "?" }
+            stateRepo.log(LogLevel.INFO, "NET", "Target resolved for $domainName → $ips")
+          }
+        }
+
+        override fun connectStart(call: Call, inetSocketAddress: InetSocketAddress, proxy: Proxy) {
+          tcpStartMs = System.currentTimeMillis()
+          lastSocketLabel = "${inetSocketAddress.address?.hostAddress ?: inetSocketAddress.hostString}:${inetSocketAddress.port}"
+          if (logVerboseEvents) {
+            stateRepo.log(LogLevel.INFO, "NET", "TCP connecting → $lastSocketLabel")
+          }
+        }
+
+        override fun secureConnectStart(call: Call) {
+          tlsStartMs = System.currentTimeMillis()
+        }
+
+        override fun secureConnectEnd(call: Call, handshake: Handshake?) {
+          if (logVerboseEvents && handshake != null) {
+            val tlsMs = (System.currentTimeMillis() - tlsStartMs).coerceAtLeast(0L)
+            stateRepo.log(
+              LogLevel.INFO,
+              "TLS",
+              "TLS ${handshake.tlsVersion.javaName} (${handshake.cipherSuite.javaName}) verified in ${tlsMs}ms",
+            )
+          }
+        }
+
+        override fun connectEnd(
+          call: Call,
+          inetSocketAddress: InetSocketAddress,
+          proxy: Proxy,
+          protocol: Protocol?,
+        ) {
+          if (logVerboseEvents) {
+            val totalMs = (System.currentTimeMillis() - tcpStartMs).coerceAtLeast(0L)
+            stateRepo.log(LogLevel.INFO, "NET", "Socket ready ($lastSocketLabel, ${totalMs}ms)")
+          }
+        }
+
+        override fun connectFailed(
+          call: Call,
+          inetSocketAddress: InetSocketAddress,
+          proxy: Proxy,
+          protocol: Protocol?,
+          ioe: IOException,
+        ) {
+          val addr = "${inetSocketAddress.address?.hostAddress ?: inetSocketAddress.hostString}:${inetSocketAddress.port}"
+          stateRepo.log(LogLevel.WARN, "NET", "Connect failed ($addr): ${ioe.message}")
+        }
+
+        override fun responseHeadersEnd(call: Call, response: Response) {
+          if (logVerboseEvents && response.code == 101) {
+            val subproto = response.header("Sec-WebSocket-Protocol") ?: "<none>"
+            stateRepo.log(LogLevel.INFO, "WS", "HTTP 101 Upgrade (Sec-WebSocket-Protocol: $subproto)")
+          }
+        }
+
+        override fun connectionAcquired(call: Call, connection: Connection) {
+          // Intentionally quiet during normal multiplexed sessions
         }
       }
     }
@@ -337,7 +597,8 @@ class WorkerVpnService : VpnService() {
 
   private fun registerUnderlyingNetworkMonitor() {
     val cm = connectivityManager ?: return
-    underlyingNetwork = findBestUnderlyingNetwork(cm)
+    val initialNet = findBestUnderlyingNetwork(cm)
+    underlyingNetwork = initialNet
 
     val request =
       NetworkRequest.Builder()
@@ -350,17 +611,23 @@ class WorkerVpnService : VpnService() {
         override fun onAvailable(network: Network) {
           val caps = runCatching { cm.getNetworkCapabilities(network) }.getOrNull()
           if (caps != null && caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)) {
-            underlyingNetwork = network
-            updateServiceUnderlyingNetworks(network)
+            val previous = underlyingNetwork
+            if (previous != network) {
+              underlyingNetwork = network
+              updateServiceUnderlyingNetworks(network)
+              onUnderlyingNetworkChanged(cm, network)
+            }
           }
         }
 
         override fun onCapabilitiesChanged(network: Network, networkCapabilities: NetworkCapabilities) {
           if (networkCapabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN) &&
-            networkCapabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+            networkCapabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+            underlyingNetwork == null
           ) {
             underlyingNetwork = network
             updateServiceUnderlyingNetworks(network)
+            onUnderlyingNetworkChanged(cm, network)
           }
         }
 
@@ -369,13 +636,44 @@ class WorkerVpnService : VpnService() {
             val next = findBestUnderlyingNetwork(cm, exclude = network)
             underlyingNetwork = next
             updateServiceUnderlyingNetworks(next)
+            onUnderlyingNetworkChanged(cm, next)
           }
         }
       }
 
     underlyingCallback = callback
     runCatching { cm.registerNetworkCallback(request, callback) }
-    updateServiceUnderlyingNetworks(underlyingNetwork)
+    updateServiceUnderlyingNetworks(initialNet)
+  }
+
+  private fun onUnderlyingNetworkChanged(cm: ConnectivityManager, next: Network?) {
+    sharedWorkerClient?.let { client ->
+      runCatching { client.connectionPool.evictAll() }
+    }
+    if (next != null) {
+      stateRepo.log(
+        LogLevel.INFO,
+        "NET",
+        "Underlying network switched → ${describeUnderlyingNetwork(cm, next)}; idle Worker pool reset",
+      )
+    } else {
+      stateRepo.log(
+        LogLevel.WARN,
+        "NET",
+        "Underlying network lost; waiting for physical connectivity…",
+      )
+    }
+  }
+
+  private fun describeUnderlyingNetwork(cm: ConnectivityManager?, network: Network?): String {
+    if (cm == null || network == null) return "None"
+    val caps = runCatching { cm.getNetworkCapabilities(network) }.getOrNull() ?: return "Unknown"
+    return when {
+      caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> "Wi-Fi"
+      caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> "Cellular"
+      caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> "Ethernet"
+      else -> "Physical"
+    }
   }
 
   private fun findBestUnderlyingNetwork(cm: ConnectivityManager, exclude: Network? = null): Network? {
@@ -413,25 +711,80 @@ class WorkerVpnService : VpnService() {
     }
   }
 
-  private fun prewarmWorkerTls(
+  /**
+   * Probes 1 chat.v2 WebSocket + init/ACK roundtrip (matching Cl2.py) to verify reachability.
+   * Returns null on success or a concise error description on failure.
+   */
+  private suspend fun probeWorkerHandshake(
     client: OkHttpClient,
     parsedUrl: ParsedWorkerUrl,
     cleanIp: ParsedCleanIp?,
-    logResult: Boolean = false,
-  ) {
-    val start = System.currentTimeMillis()
-    val req = WorkerProtocol.buildPrewarmRequest(parsedUrl, cleanIp)
-    runCatching {
-      client.newCall(req).execute().use { resp ->
-        if (logResult) {
-          val elapsed = System.currentTimeMillis() - start
-          stateRepo.log(
-            LogLevel.INFO,
-            "WARM",
-            "TLS & Worker isolate pre-warmed in ${elapsed}ms (HTTP ${resp.code})",
-          )
+    uuid: String,
+  ): String? {
+    val req = WorkerProtocol.buildWebSocketRequest(parsedUrl, cleanIp)
+    return try {
+      withTimeout(8_000L) {
+        suspendCancellableCoroutine<String?> { cont ->
+          var sessionKey = ByteArray(0)
+          val ws =
+            client.newWebSocket(
+              req,
+              object : WebSocketListener() {
+                override fun onOpen(webSocket: WebSocket, response: Response) {
+                  val negProto = response.header("Sec-WebSocket-Protocol")
+                  if (negProto != null && !negProto.equals(WorkerProtocol.SUBPROTOCOL, ignoreCase = true)) {
+                    webSocket.close(1002, "Subprotocol mismatch")
+                    if (cont.isActive) cont.resume("Subprotocol mismatch: $negProto")
+                    return
+                  }
+                  if (negProto == null) {
+                    stateRepo.log(LogLevel.WARN, "WS", "Server omitted Sec-WebSocket-Protocol header (expected chat.v2)")
+                  }
+                  val (initFrame, key) =
+                    WorkerProtocol.buildInitPacket(
+                      uuid = uuid,
+                      targetHost = "cp.cloudflare.com",
+                      targetPort = 80,
+                    )
+                  sessionKey = key
+                  val sent = webSocket.send(initFrame.toByteString())
+                  if (!sent) {
+                    webSocket.cancel()
+                    if (cont.isActive) cont.resume("Failed to send init frame")
+                  } else {
+                    stateRepo.log(LogLevel.INFO, "WS", "Custom init frame sent (${initFrame.size}B)")
+                  }
+                }
+
+                override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
+                  val ok = WorkerProtocol.verifyAck(bytes.toByteArray(), sessionKey)
+                  webSocket.close(1000, "Probe done")
+                  if (cont.isActive) {
+                    cont.resume(if (ok) null else "Invalid Worker ACK (check UUID)")
+                  }
+                }
+
+                override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                  if (cont.isActive) {
+                    val msg =
+                      if (response != null) "HTTP ${response.code}"
+                      else (t.message ?: t.javaClass.simpleName)
+                    cont.resume(msg)
+                  }
+                }
+
+                override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                  if (cont.isActive) {
+                    cont.resume("Closed ($code): $reason")
+                  }
+                }
+              },
+            )
+          cont.invokeOnCancellation { ws.cancel() }
         }
       }
+    } catch (e: Exception) {
+      e.message ?: "Timeout"
     }
   }
 
@@ -482,7 +835,6 @@ class WorkerVpnService : VpnService() {
         }
       }
       if (addedCount == 0) {
-        // Fallback if none of the saved packages exist on device
         runCatching { builder.addDisallowedApplication(packageName) }
       }
     } else {
@@ -497,22 +849,21 @@ class WorkerVpnService : VpnService() {
     return builder.establish()
   }
 
-  private fun resolveLiteralAddress(host: String): InetAddress {
-    val clean = host.trim().removePrefix("[").removeSuffix("]")
-    WorkerProtocol.parseIpv4Bytes(clean)?.let { return InetAddress.getByAddress(clean, it) }
-    WorkerProtocol.parseIpv6Bytes(clean)?.let { return InetAddress.getByAddress(clean, it) }
-    throw UnknownHostException("DNS disabled for socket connection: '$host'")
-  }
-
   private fun createProtectedSocketFactory(): SocketFactory {
     val defaultFactory = SocketFactory.getDefault()
     fun configure(socket: Socket): Socket {
-      // Protect fd from VPN routing AND bind directly onto the unprotected Wi-Fi/Cellular network
-      protect(socket)
-      underlyingNetwork?.let { net ->
-        runCatching { net.bindSocket(socket) }
+      // protect() excludes the socket from VPN routing while preserving OS 464XLAT (IPv4) & IPv6 routes
+      val protectedOk = protect(socket)
+      if (!protectedOk) {
+        val now = System.currentTimeMillis()
+        if (now - lastProtectWarnMs > 5_000L) {
+          lastProtectWarnMs = now
+          stateRepo.log(LogLevel.WARN, "NET", "VpnService.protect(socket) returned false")
+        }
       }
       runCatching { socket.tcpNoDelay = true }
+      runCatching { socket.receiveBufferSize = 256 * 1024 }
+      runCatching { socket.sendBufferSize = 256 * 1024 }
       return socket
     }
     return object : SocketFactory() {
@@ -520,47 +871,70 @@ class WorkerVpnService : VpnService() {
 
       override fun createSocket(host: String, port: Int): Socket {
         val socket = configure(defaultFactory.createSocket())
-        socket.connect(InetSocketAddress(resolveLiteralAddress(host), port), 6000)
+        socket.connect(InetSocketAddress(host, port), 8000)
         return socket
       }
 
       override fun createSocket(host: String, port: Int, localHost: InetAddress, localPort: Int): Socket {
         val socket = configure(defaultFactory.createSocket())
         socket.bind(InetSocketAddress(localHost, localPort))
-        socket.connect(InetSocketAddress(resolveLiteralAddress(host), port), 6000)
+        socket.connect(InetSocketAddress(host, port), 8000)
         return socket
       }
 
       override fun createSocket(host: InetAddress, port: Int): Socket {
         val socket = configure(defaultFactory.createSocket())
-        socket.connect(InetSocketAddress(host, port), 6000)
+        socket.connect(InetSocketAddress(host, port), 8000)
         return socket
       }
 
       override fun createSocket(address: InetAddress, port: Int, localAddress: InetAddress, localPort: Int): Socket {
         val socket = configure(defaultFactory.createSocket())
         socket.bind(InetSocketAddress(localAddress, localPort))
-        socket.connect(InetSocketAddress(address, port), 6000)
+        socket.connect(InetSocketAddress(address, port), 8000)
         return socket
       }
     }
   }
 
   private fun stopTunnel() {
-    tunnelActive = false
-    cleanupEngine()
+    val wasActive: Boolean
+    synchronized(engineLock) {
+      connectionAttemptSeq.incrementAndGet()
+      wasActive = tunnelActive
+      tunnelActive = false
+      if (wasActive) {
+        stateRepo.updateStatus(VpnStatus.Disconnecting)
+      }
+      cleanupEngineLocked()
+    }
     stateRepo.updateStatus(VpnStatus.Disconnected)
-    stateRepo.log(LogLevel.INFO, "VPN", "Tunnel stopped")
+    if (wasActive) {
+      stateRepo.log(LogLevel.INFO, "VPN", "Tunnel disconnected & resources released")
+    }
+    removeForegroundCompat()
+    stopSelf()
+  }
+
+  private fun removeForegroundCompat() {
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
       stopForeground(STOP_FOREGROUND_REMOVE)
     } else {
       @Suppress("DEPRECATION")
       stopForeground(true)
     }
-    stopSelf()
   }
 
-  private fun cleanupEngine() {
+  private fun shutdownOkHttpClient(client: OkHttpClient?) {
+    if (client == null) return
+    runCatching {
+      client.dispatcher.cancelAll()
+      client.dispatcher.executorService.shutdown()
+      client.connectionPool.evictAll()
+    }
+  }
+
+  private fun cleanupEngineLocked() {
     underlyingCallback?.let { cb ->
       runCatching { connectivityManager?.unregisterNetworkCallback(cb) }
     }
@@ -573,12 +947,7 @@ class WorkerVpnService : VpnService() {
     tcpManager = null
     hostMapper?.clear()
     hostMapper = null
-    sharedWorkerClient?.let { client ->
-      runCatching {
-        client.dispatcher.executorService.shutdown()
-        client.connectionPool.evictAll()
-      }
-    }
+    shutdownOkHttpClient(sharedWorkerClient)
     sharedWorkerClient = null
     outboundQueue.clear()
     runCatching { tunInterface?.close() }

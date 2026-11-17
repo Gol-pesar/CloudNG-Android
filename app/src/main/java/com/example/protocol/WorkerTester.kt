@@ -34,139 +34,221 @@ class WorkerTester(
       }
 
       val cleanIp = WorkerProtocol.parseCleanIp(config.cleanIp)
-      val targetIp =
-        WorkerProtocol.resolveTargetIp(parsedUrl, cleanIp)
-          ?: return@withContext HandshakeTestResult(
-            success = false,
-            errorMessage = "Clean IP (IPv4/IPv6) is required — DNS is disabled",
+      if (cleanIp != null) {
+        val cleanIpResult =
+          runSingleHandshakeAttempt(
+            parsedUrl = parsedUrl,
+            uuid = config.uuid,
+            cleanIp = cleanIp,
+            preferIpv6Fallback = false,
+            label = cleanIp.host,
           )
-      val startMs = System.currentTimeMillis()
-      val resolvedIpDisplay = targetIp
+        if (cleanIpResult.success == true || cleanIpResult.errorMessage?.contains("UUID", ignoreCase = true) == true) {
+          return@withContext cleanIpResult
+        }
+        vpnStateRepository.log(
+          LogLevel.WARN,
+          "TEST",
+          "Clean IP ${cleanIp.host} failed (${cleanIpResult.errorMessage}); falling back to ${parsedUrl.host} (IPv6-first)…",
+        )
+      }
 
-      val client = WorkerProtocol.createWorkerOkHttpClient(
-        workerHost = parsedUrl.host,
-        cleanIp = cleanIp,
-        connectTimeoutSec = 8L,
+      runSingleHandshakeAttempt(
+        parsedUrl = parsedUrl,
+        uuid = config.uuid,
+        cleanIp = null,
+        preferIpv6Fallback = cleanIp != null,
+        label = "${parsedUrl.host} (Direct)",
       )
-      val request = WorkerProtocol.buildWebSocketRequest(parsedUrl, cleanIp)
+    }
 
-      try {
-        withTimeout(12_000L) {
-          suspendCancellableCoroutine<HandshakeTestResult> { cont ->
-            var wsOpenMs = 0L
-            var ackVerified = false
-            var sessionKey = ByteArray(0)
+  private suspend fun runSingleHandshakeAttempt(
+    parsedUrl: ParsedWorkerUrl,
+    uuid: String,
+    cleanIp: ParsedCleanIp?,
+    preferIpv6Fallback: Boolean,
+    label: String,
+  ): HandshakeTestResult {
+    val listenerFactory =
+      okhttp3.EventListener.Factory {
+        object : okhttp3.EventListener() {
+          @Volatile private var tlsStartMs = 0L
 
-            val ws =
-              client.newWebSocket(
-                request,
-                object : WebSocketListener() {
-                  override fun onOpen(webSocket: WebSocket, response: Response) {
-                    wsOpenMs = System.currentTimeMillis() - startMs
-                    val httpProbe =
-                      "HEAD /generate_204 HTTP/1.1\r\nHost: cp.cloudflare.com\r\nConnection: close\r\n\r\n"
-                        .toByteArray(Charsets.UTF_8)
-                    val (initFrame, key) =
-                      WorkerProtocol.buildInitPacket(
-                        uuid = config.uuid,
-                        targetHost = "cp.cloudflare.com",
-                        targetPort = 80,
-                      )
-                    sessionKey = key
-                    webSocket.send(initFrame.toByteString())
-                    webSocket.send(WorkerProtocol.xorBuf(httpProbe, key).toByteString())
-                  }
+          override fun connectStart(
+            call: okhttp3.Call,
+            inetSocketAddress: java.net.InetSocketAddress,
+            proxy: java.net.Proxy,
+          ) {
+            val addr = "${inetSocketAddress.address?.hostAddress ?: inetSocketAddress.hostString}:${inetSocketAddress.port}"
+            vpnStateRepository.log(LogLevel.INFO, "TEST", "TCP connecting → $addr")
+          }
 
-                  override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
-                    val data = bytes.toByteArray()
-                    if (!ackVerified) {
-                      if (WorkerProtocol.verifyAck(data, sessionKey)) {
-                        ackVerified = true
-                        vpnStateRepository.log(
-                          LogLevel.INFO,
-                          "TEST",
-                          "Worker ACK verified via ${resolvedIpDisplay ?: parsedUrl.host} (${System.currentTimeMillis() - startMs}ms)",
-                        )
-                      } else {
-                        webSocket.close(1002, "Bad ACK")
-                        if (cont.isActive) {
-                          cont.resume(
-                            HandshakeTestResult(
-                              success = false,
-                              wsConnectMs = wsOpenMs,
-                              resolvedIp = resolvedIpDisplay,
-                              errorMessage = "UUID mismatch or invalid Worker ACK",
-                            )
-                          )
-                        }
-                      }
-                    } else {
-                      val decrypted = WorkerProtocol.xorBuf(data, sessionKey)
-                      val text = decrypted.toString(Charsets.UTF_8)
-                      val statusLine = text.lineSequence().firstOrNull()?.trim() ?: "OK"
-                      val totalMs = System.currentTimeMillis() - startMs
-                      webSocket.close(1000, "Done")
-                      if (cont.isActive) {
-                        cont.resume(
-                          HandshakeTestResult(
-                            success = true,
-                            wsConnectMs = wsOpenMs,
-                            totalRttMs = totalMs,
-                            resolvedIp = resolvedIpDisplay,
-                            httpStatus = statusLine,
-                          )
-                        )
-                      }
-                    }
-                  }
+          override fun secureConnectStart(call: okhttp3.Call) {
+            tlsStartMs = System.currentTimeMillis()
+          }
 
-                  override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                    val msg =
-                      if (response != null) "HTTP ${response.code}: ${t.message}"
-                      else t.message ?: "Connection failed"
-                    vpnStateRepository.log(LogLevel.ERROR, "TEST", "Worker test failed: $msg")
+          override fun secureConnectEnd(call: okhttp3.Call, handshake: okhttp3.Handshake?) {
+            if (handshake != null) {
+              val ms = (System.currentTimeMillis() - tlsStartMs).coerceAtLeast(0L)
+              vpnStateRepository.log(
+                LogLevel.INFO,
+                "TEST",
+                "TLS ${handshake.tlsVersion.javaName} (${handshake.cipherSuite.javaName}) OK (${ms}ms)",
+              )
+            }
+          }
+
+          override fun responseHeadersEnd(call: okhttp3.Call, response: Response) {
+            if (response.code == 101) {
+              val proto = response.header("Sec-WebSocket-Protocol") ?: "<none>"
+              vpnStateRepository.log(LogLevel.INFO, "TEST", "HTTP 101 WS Upgrade (subproto=$proto)")
+            }
+          }
+        }
+      }
+
+    val startMs = System.currentTimeMillis()
+    val client = WorkerProtocol.createWorkerOkHttpClient(
+      workerHost = parsedUrl.host,
+      cleanIp = cleanIp,
+      connectTimeoutSec = 8L,
+      preferIpv6Fallback = preferIpv6Fallback,
+      eventListenerFactory = listenerFactory,
+    )
+    val request = WorkerProtocol.buildWebSocketRequest(parsedUrl, cleanIp)
+
+    return try {
+      withTimeout(12_000L) {
+        suspendCancellableCoroutine<HandshakeTestResult> { cont ->
+          var wsOpenMs = 0L
+          var ackVerified = false
+          var sessionKey = ByteArray(0)
+
+          val ws =
+            client.newWebSocket(
+              request,
+              object : WebSocketListener() {
+                override fun onOpen(webSocket: WebSocket, response: Response) {
+                  val negProto = response.header("Sec-WebSocket-Protocol")
+                  if (negProto != null && !negProto.equals(WorkerProtocol.SUBPROTOCOL, ignoreCase = true)) {
+                    webSocket.close(1002, "Subprotocol mismatch")
                     if (cont.isActive) {
                       cont.resume(
                         HandshakeTestResult(
                           success = false,
-                          wsConnectMs = if (wsOpenMs > 0) wsOpenMs else null,
-                          resolvedIp = resolvedIpDisplay,
-                          errorMessage = msg,
+                          resolvedIp = label,
+                          errorMessage = "Subprotocol mismatch: $negProto",
                         )
                       )
                     }
+                    return
                   }
+                  wsOpenMs = System.currentTimeMillis() - startMs
+                  val httpProbe =
+                    "HEAD /generate_204 HTTP/1.1\r\nHost: cp.cloudflare.com\r\nConnection: close\r\n\r\n"
+                      .toByteArray(Charsets.UTF_8)
+                  val (initFrame, key) =
+                    WorkerProtocol.buildInitPacket(
+                      uuid = uuid,
+                      targetHost = "cp.cloudflare.com",
+                      targetPort = 80,
+                    )
+                  sessionKey = key
+                  webSocket.send(initFrame.toByteString())
+                  webSocket.send(WorkerProtocol.xorBuf(httpProbe, key).toByteString())
+                }
 
-                  override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
+                  val data = bytes.toByteArray()
+                  if (!ackVerified) {
+                    if (WorkerProtocol.verifyAck(data, sessionKey)) {
+                      ackVerified = true
+                      vpnStateRepository.log(
+                        LogLevel.INFO,
+                        "TEST",
+                        "Worker ACK verified via $label (${System.currentTimeMillis() - startMs}ms)",
+                      )
+                    } else {
+                      webSocket.close(1002, "Bad ACK")
+                      if (cont.isActive) {
+                        cont.resume(
+                          HandshakeTestResult(
+                            success = false,
+                            wsConnectMs = wsOpenMs,
+                            resolvedIp = label,
+                            errorMessage = "UUID mismatch or invalid Worker ACK",
+                          )
+                        )
+                      }
+                    }
+                  } else {
+                    val decrypted = WorkerProtocol.xorBuf(data, sessionKey)
+                    val text = decrypted.toString(Charsets.UTF_8)
+                    val statusLine = text.lineSequence().firstOrNull()?.trim() ?: "OK"
+                    val totalMs = System.currentTimeMillis() - startMs
+                    webSocket.close(1000, "Done")
                     if (cont.isActive) {
-                      val totalMs = System.currentTimeMillis() - startMs
                       cont.resume(
                         HandshakeTestResult(
-                          success = ackVerified,
-                          wsConnectMs = if (wsOpenMs > 0) wsOpenMs else null,
-                          totalRttMs = if (ackVerified) totalMs else null,
-                          resolvedIp = resolvedIpDisplay,
-                          errorMessage = if (ackVerified) null else "Closed ($code): $reason",
+                          success = true,
+                          wsConnectMs = wsOpenMs,
+                          totalRttMs = totalMs,
+                          resolvedIp = label,
+                          httpStatus = statusLine,
                         )
                       )
                     }
                   }
-                },
-              )
-            cont.invokeOnCancellation { ws.cancel() }
-          }
+                }
+
+                override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                  val msg =
+                    if (response != null) "HTTP ${response.code}: ${t.message}"
+                    else t.message ?: "Connection failed"
+                  vpnStateRepository.log(LogLevel.ERROR, "TEST", "Worker test failed ($label): $msg")
+                  if (cont.isActive) {
+                    cont.resume(
+                      HandshakeTestResult(
+                        success = false,
+                        wsConnectMs = if (wsOpenMs > 0) wsOpenMs else null,
+                        resolvedIp = label,
+                        errorMessage = msg,
+                      )
+                    )
+                  }
+                }
+
+                override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                  if (cont.isActive) {
+                    val totalMs = System.currentTimeMillis() - startMs
+                    cont.resume(
+                      HandshakeTestResult(
+                        success = ackVerified,
+                        wsConnectMs = if (wsOpenMs > 0) wsOpenMs else null,
+                        totalRttMs = if (ackVerified) totalMs else null,
+                        resolvedIp = label,
+                        errorMessage = if (ackVerified) null else "Closed ($code): $reason",
+                      )
+                    )
+                  }
+                }
+              },
+            )
+          cont.invokeOnCancellation { ws.cancel() }
         }
-      } catch (e: Exception) {
-        HandshakeTestResult(
-          success = false,
-          resolvedIp = resolvedIpDisplay,
-          errorMessage = e.message ?: "Timeout",
-        )
-      } finally {
-        client.dispatcher.executorService.shutdown()
-        client.connectionPool.evictAll()
       }
+    } catch (e: Exception) {
+      HandshakeTestResult(
+        success = false,
+        resolvedIp = label,
+        errorMessage = e.message ?: "Timeout",
+      )
+    } finally {
+      client.dispatcher.cancelAll()
+      client.dispatcher.executorService.shutdown()
+      client.connectionPool.evictAll()
     }
+  }
 
   suspend fun benchmarkCleanIp(
     workerUrl: String,
